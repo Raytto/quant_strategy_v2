@@ -1,0 +1,6 @@
+# .env 文件永不上传
+.env
+.env.*
+!.env.example
+# 数据文件不上传
+/data/
