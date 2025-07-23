@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "quant-strategy-v2"
+version = "0.1.0"
+description = ""
+authors = ["Raytto <306483372@qq.com>"]
+readme = "README.md"
+packages = [{ include = "qs", from = "src" }]
+# optional: if you later publish to PyPI
+# license = "MIT"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.1"
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
