@@ -3,4 +3,6 @@
 .env.*
 !.env.example
 # 数据文件不上传
-/data/
+data/*
+!data/.gitkeep
+!data/ah_codes.csv
