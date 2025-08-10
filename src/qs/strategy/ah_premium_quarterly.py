@@ -40,6 +40,7 @@ from typing import List, Dict, Optional, Sequence
 import duckdb
 from ..backtester.data import Bar, DataFeed
 from ..backtester.broker import Broker
+import time
 
 
 @dataclass
@@ -66,10 +67,11 @@ class AHPremiumQuarterlyStrategy:
         top_k: int = 5,
         bottom_k: int = 5,
         start_date: str = "20180101",
-        capital_split: float = 0.5,  # fraction to H leg; remainder to A leg
+        capital_split: float = 0.5,
         price_cache_days: int = 30,
-        use_adjusted: bool = True,  # 统一使用前复权价 (含再投资假设)
+        use_adjusted: bool = True,
     ):
+        t0 = time.perf_counter()
         self.dbp = db_path_processed
         self.dbr = db_path_raw
         self.top_k = top_k
@@ -80,10 +82,25 @@ class AHPremiumQuarterlyStrategy:
         self.use_adjusted = use_adjusted
         self._last_rebalance_quarter: Optional[str] = None
         self._latest_premium_date: Optional[str] = None
-        # cache for open prices per day (already converted into CNY for HK symbols)
         self._open_cache: Dict[str, Dict[str, float]] = {}
-        # FX cache: trade_date -> hk_to_cny rate
         self._fx_cache: Dict[str, float] = {}
+        self._max_adj_a: Dict[str, float] = {}
+        self._max_adj_h: Dict[str, float] = {}
+        if self.use_adjusted:
+            con = duckdb.connect(self.dbr, read_only=True)
+            for row in con.execute(
+                "SELECT ts_code, MAX(adj_factor) FROM adj_factor_a GROUP BY ts_code"
+            ).fetchall():
+                self._max_adj_a[row[0]] = float(row[1])
+            for row in con.execute(
+                "SELECT ts_code, MAX(adj_factor) FROM adj_factor_h GROUP BY ts_code"
+            ).fetchall():
+                self._max_adj_h[row[0]] = float(row[1])
+            con.close()
+        t1 = time.perf_counter()
+        print(
+            f"[AHPremiumQuarterlyStrategy] __init__ preload max_adj_factor: {t1-t0:.3f}s"
+        )
 
     # --- FX helpers ---------------------------------------------------
     def _load_hk_to_cny_rate(self, trade_date: str) -> Optional[float]:
@@ -119,84 +136,69 @@ class AHPremiumQuarterlyStrategy:
 
     # --- data helpers -------------------------------------------------
     def _load_premium_for_date(self, trade_date: str) -> List[PremiumRecord]:
-        """Compute premium records for a specific trade_date.
-
-        If use_adjusted=True: 使用前复权 close (按 close * adj_factor / MAX(adj_factor) )
-        否则使用原始未复权 close。
-        """
-        # detect header mapping for hk column (hk_code or c)
-        hk_col = 'hk_code'
+        t0 = time.perf_counter()
+        hk_col = "hk_code"
         try:
-            with open('data/ah_codes.csv', 'r', encoding='utf-8') as f:
-                header = f.readline().strip().split(',')
-            if 'hk_code' not in header and 'c' in header:
-                hk_col = 'c'
+            with open("data/ah_codes.csv", "r", encoding="utf-8") as f:
+                header = f.readline().strip().split(",")
+            if "hk_code" not in header and "c" in header:
+                hk_col = "c"
         except Exception:
             pass
         con = duckdb.connect(self.dbr, read_only=True)
-        if self.use_adjusted:
-            q = f"""
-            WITH mapping AS (
-              SELECT name, cn_code, {hk_col} AS hk_code FROM read_csv_auto('data/ah_codes.csv')
-            ),
-            a_raw AS (
-              SELECT d.ts_code, d.trade_date, d.close, f.adj_factor,
-                     MAX(f.adj_factor) OVER (PARTITION BY d.ts_code) AS max_af
-              FROM daily_a d JOIN adj_factor_a f USING (ts_code, trade_date)
-              WHERE d.trade_date='{trade_date}'
-            ),
-            h_raw AS (
-              SELECT d.ts_code, d.trade_date, d.close, f.adj_factor,
-                     MAX(f.adj_factor) OVER (PARTITION BY d.ts_code) AS max_af
-              FROM daily_h d JOIN adj_factor_h f USING (ts_code, trade_date)
-              WHERE d.trade_date='{trade_date}'
-            ),
-            fx AS (
-              SELECT '{trade_date}' AS trade_date,
-                     (SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDCNH.FXCM' AND trade_date='{trade_date}') AS usd_cnh_mid,
-                     (SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDHKD.FXCM' AND trade_date='{trade_date}') AS usd_hkd_mid
-            )
-            SELECT a_raw.trade_date, m.name, m.cn_code, m.hk_code,
-                   (a_raw.close * a_raw.adj_factor / a_raw.max_af) AS close_a_fq,
-                   (h_raw.close * h_raw.adj_factor / h_raw.max_af) AS close_h_hkd_fq,
-                   fx.usd_cnh_mid, fx.usd_hkd_mid,
-                   (h_raw.close * h_raw.adj_factor / h_raw.max_af) * (fx.usd_cnh_mid / fx.usd_hkd_mid) AS close_h_cny_fq,
-                   ( (a_raw.close * a_raw.adj_factor / a_raw.max_af) /
-                     NULLIF( (h_raw.close * h_raw.adj_factor / h_raw.max_af) * (fx.usd_cnh_mid / fx.usd_hkd_mid), 0) - 1) * 100 AS premium_pct
-            FROM mapping m
-            JOIN a_raw ON a_raw.ts_code = m.cn_code
-            JOIN h_raw ON h_raw.ts_code = m.hk_code
-            JOIN fx ON fx.trade_date = a_raw.trade_date
-            WHERE fx.usd_cnh_mid IS NOT NULL AND fx.usd_hkd_mid IS NOT NULL
-            """
-        else:
-            q = f"""
-            WITH mapping AS (SELECT name, cn_code, {hk_col} AS hk_code FROM read_csv_auto('data/ah_codes.csv')),
-            a_raw AS (
-              SELECT ts_code, trade_date, close FROM daily_a WHERE trade_date='{trade_date}'
-            ),
-            h_raw AS (
-              SELECT ts_code, trade_date, close FROM daily_h WHERE trade_date='{trade_date}'
-            ),
-            fx AS (
-              SELECT '{trade_date}' AS trade_date,
-                     (SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDCNH.FXCM' AND trade_date='{trade_date}') AS usd_cnh_mid,
-                     (SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDHKD.FXCM' AND trade_date='{trade_date}') AS usd_hkd_mid
-            )
-            SELECT a_raw.trade_date, m.name, m.cn_code, m.hk_code,
-                   a_raw.close AS close_a,
-                   h_raw.close AS close_h_hkd,
-                   fx.usd_cnh_mid, fx.usd_hkd_mid,
-                   ( (a_raw.close) / NULLIF( (h_raw.close) * (fx.usd_cnh_mid / fx.usd_hkd_mid), 0) - 1) * 100 AS premium_pct
-            FROM mapping m
-            JOIN a_raw ON a_raw.ts_code = m.cn_code
-            JOIN h_raw ON h_raw.ts_code = m.hk_code
-            JOIN fx ON fx.trade_date = a_raw.trade_date
-            WHERE fx.usd_cnh_mid IS NOT NULL AND fx.usd_hkd_mid IS NOT NULL
-            """
-        rows = con.execute(q).fetchall()
+        mapping = con.execute(
+            f"SELECT name, cn_code, {hk_col} AS hk_code FROM read_csv_auto('data/ah_codes.csv')"
+        ).fetchall()
+        a_codes = [row[1] for row in mapping]
+        h_codes = [row[2] for row in mapping]
+        a_raw = {
+            row[0]: (float(row[1]), float(row[2]))
+            for row in con.execute(
+                f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_codes])})"
+            ).fetchall()
+        }
+        h_raw = {
+            row[0]: (float(row[1]), float(row[2]))
+            for row in con.execute(
+                f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_codes])})"
+            ).fetchall()
+        }
+        fx_row = con.execute(
+            f"SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDCNH.FXCM' AND trade_date='{trade_date}'"
+        ).fetchone()
+        usd_cnh_mid = float(fx_row[0]) if fx_row and fx_row[0] is not None else None
+        fx_row = con.execute(
+            f"SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDHKD.FXCM' AND trade_date='{trade_date}'"
+        ).fetchone()
+        usd_hkd_mid = float(fx_row[0]) if fx_row and fx_row[0] is not None else None
         con.close()
-        recs = [PremiumRecord(r[0], r[1], r[2], r[3], r[-1]) for r in rows]
+        if usd_cnh_mid is None or usd_hkd_mid is None:
+            t1 = time.perf_counter()
+            print(
+                f"[AHPremiumQuarterlyStrategy] _load_premium_for_date({trade_date}) missing FX: {t1-t0:.3f}s"
+            )
+            return []
+        hk_to_cny = usd_cnh_mid / usd_hkd_mid if usd_hkd_mid else None
+        recs = []
+        for name, cn_code, hk_code in mapping:
+            if cn_code not in a_raw or hk_code not in h_raw:
+                continue
+            close_a, adj_a = a_raw[cn_code]
+            close_h, adj_h = h_raw[hk_code]
+            max_af_a = self._max_adj_a.get(cn_code, 1.0)
+            max_af_h = self._max_adj_h.get(hk_code, 1.0)
+            close_a_fq = close_a * adj_a / max_af_a
+            close_h_hkd_fq = close_h * adj_h / max_af_h
+            close_h_cny_fq = close_h_hkd_fq * hk_to_cny if hk_to_cny else None
+            if close_h_cny_fq and close_h_cny_fq != 0:
+                premium_pct = (close_a_fq / close_h_cny_fq - 1) * 100
+                recs.append(
+                    PremiumRecord(trade_date, name, cn_code, hk_code, premium_pct)
+                )
+        t1 = time.perf_counter()
+        print(
+            f"[AHPremiumQuarterlyStrategy] _load_premium_for_date({trade_date}): {t1-t0:.3f}s, {len(recs)} records"
+        )
         if recs:
             self._latest_premium_date = recs[0].trade_date
         return recs
@@ -214,50 +216,43 @@ class AHPremiumQuarterlyStrategy:
 
     # load open prices for target symbols for the current bar.trade_date, converting HKD->CNY and adjusting if needed
     def _load_opens(self, trade_date: str, symbols: Sequence[str]) -> Dict[str, float]:
+        t0 = time.perf_counter()
         if trade_date in self._open_cache:
             cache = self._open_cache[trade_date]
             if all(s in cache for s in symbols):
                 return {s: cache[s] for s in symbols}
         con = duckdb.connect(self.dbr, read_only=True)
-        a_syms = [s for s in symbols if s.endswith('.SH') or s.endswith('.SZ')]
-        h_syms = [s for s in symbols if s.endswith('.HK')]
         res: Dict[str, float] = {}
+        a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
+        h_syms = [s for s in symbols if s.endswith(".HK")]
         if a_syms:
-            if self.use_adjusted:
-                q_a = f"""
-                WITH mx AS (SELECT ts_code, MAX(adj_factor) max_af FROM adj_factor_a GROUP BY ts_code)
-                SELECT d.ts_code, d.open * f.adj_factor / mx.max_af AS open_fq
-                FROM daily_a d
-                JOIN adj_factor_a f USING (ts_code, trade_date)
-                JOIN mx USING (ts_code)
-                WHERE d.trade_date='{trade_date}' AND d.ts_code IN ({','.join([repr(x) for x in a_syms])})
-                """
-            else:
-                q_a = f"SELECT ts_code, open FROM daily_a WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
-            for ts, op in con.execute(q_a).fetchall():
-                res[ts] = float(op)
+            rows = con.execute(
+                f"SELECT ts_code, open, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
+            ).fetchall()
+            for ts, open_, adj in rows:
+                max_af = self._max_adj_a.get(ts, 1.0)
+                res[ts] = float(open_) * float(adj) / max_af
         if h_syms:
-            if self.use_adjusted:
-                q_h = f"""
-                WITH mx AS (SELECT ts_code, MAX(adj_factor) max_af FROM adj_factor_h GROUP BY ts_code)
-                SELECT d.ts_code, d.open * f.adj_factor / mx.max_af AS open_fq
-                FROM daily_h d
-                JOIN adj_factor_h f USING (ts_code, trade_date)
-                JOIN mx USING (ts_code)
-                WHERE d.trade_date='{trade_date}' AND d.ts_code IN ({','.join([repr(x) for x in h_syms])})
-                """
-            else:
-                q_h = f"SELECT ts_code, open FROM daily_h WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
-            raw_h = {ts: float(op) for ts, op in con.execute(q_h).fetchall()}
-            if raw_h:
-                rate = self._load_hk_to_cny_rate(trade_date)
-                if rate is None:
-                    con.close()
-                    return {}
-                for ts, op in raw_h.items():
-                    res[ts] = op * rate
+            rows = con.execute(
+                f"SELECT ts_code, open, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
+            ).fetchall()
+            rate = self._load_hk_to_cny_rate(trade_date)
+            if rate is None:
+                con.close()
+                t1 = time.perf_counter()
+                print(
+                    f"[AHPremiumQuarterlyStrategy] _load_opens({trade_date}) missing FX: {t1-t0:.3f}s"
+                )
+                return {}
+            for ts, open_, adj in rows:
+                max_af = self._max_adj_h.get(ts, 1.0)
+                res[ts] = float(open_) * float(adj) / max_af * rate
         con.close()
         self._open_cache.setdefault(trade_date, {}).update(res)
+        t1 = time.perf_counter()
+        print(
+            f"[AHPremiumQuarterlyStrategy] _load_opens({trade_date}): {t1-t0:.3f}s, {len(res)} symbols"
+        )
         return res
 
     # mark held symbols to compute equity after close (use close price for valuation, converted)
@@ -266,59 +261,41 @@ class AHPremiumQuarterlyStrategy:
         if not symbols:
             return {}
         con = duckdb.connect(self.dbr, read_only=True)
-        a_syms = [s for s in symbols if s.endswith('.SH') or s.endswith('.SZ')]
-        h_syms = [s for s in symbols if s.endswith('.HK')]
         res: Dict[str, float] = {}
+        a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
+        h_syms = [s for s in symbols if s.endswith(".HK")]
         if a_syms:
-            if self.use_adjusted:
-                q_a = f"""
-                WITH mx AS (SELECT ts_code, MAX(adj_factor) max_af FROM adj_factor_a GROUP BY ts_code)
-                SELECT d.ts_code, d.close * f.adj_factor / mx.max_af AS close_fq
-                FROM daily_a d
-                JOIN adj_factor_a f USING (ts_code, trade_date)
-                JOIN mx USING (ts_code)
-                WHERE d.trade_date='{bar.trade_date}' AND d.ts_code IN ({','.join([repr(x) for x in a_syms])})
-                """
-            else:
-                q_a = f"SELECT ts_code, close FROM daily_a WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
-            for ts, cl in con.execute(q_a).fetchall():
-                res[ts] = float(cl)
+            rows = con.execute(
+                f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
+            ).fetchall()
+            for ts, close_, adj in rows:
+                max_af = self._max_adj_a.get(ts, 1.0)
+                res[ts] = float(close_) * float(adj) / max_af
         if h_syms:
-            if self.use_adjusted:
-                q_h = f"""
-                WITH mx AS (SELECT ts_code, MAX(adj_factor) max_af FROM adj_factor_h GROUP BY ts_code)
-                SELECT d.ts_code, d.close * f.adj_factor / mx.max_af AS close_fq
-                FROM daily_h d
-                JOIN adj_factor_h f USING (ts_code, trade_date)
-                JOIN mx USING (ts_code)
-                WHERE d.trade_date='{bar.trade_date}' AND d.ts_code IN ({','.join([repr(x) for x in h_syms])})
-                """
-            else:
-                q_h = f"SELECT ts_code, close FROM daily_h WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
-            raw_h = {ts: float(cl) for ts, cl in con.execute(q_h).fetchall()}
-            if raw_h:
-                rate = self._load_hk_to_cny_rate(bar.trade_date)
-                if rate is None:
-                    con.close()
-                    return {}
-                for ts, cl in raw_h.items():
-                    res[ts] = cl * rate
+            rows = con.execute(
+                f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
+            ).fetchall()
+            rate = self._load_hk_to_cny_rate(bar.trade_date)
+            if rate is None:
+                con.close()
+                return {}
+            for ts, close_, adj in rows:
+                max_af = self._max_adj_h.get(ts, 1.0)
+                res[ts] = float(close_) * float(adj) / max_af * rate
         con.close()
         return res
 
     # --- core event ----------------------------------------------------
     def on_bar(self, bar: Bar, feed: DataFeed, broker: Broker):
+        t0 = time.perf_counter()
         if not self._is_quarter_rebalance_day(bar, feed):
             return
-        # Rebalance using previous trading day's premium snapshot (avoid lookahead)
         prev_bar = feed.prev
         if prev_bar is None:
             return
         premium_recs = self._load_premium_for_date(prev_bar.trade_date)
         if not premium_recs:
             return
-        # Rank: high premium -> A expensive -> choose H leg to buy (hk_code)
-        #       low premium  -> A cheap     -> choose A leg to buy (cn_code)
         sorted_recs = sorted(premium_recs, key=lambda r: r.premium_pct)
         bottom = sorted_recs[: self.bottom_k]
         top = sorted_recs[-self.top_k :]
@@ -326,16 +303,21 @@ class AHPremiumQuarterlyStrategy:
         h_symbols = [r.hk_code for r in top]
         if not a_symbols or not h_symbols:
             return
-        # target weights
         w_each_a = (1 - self.capital_split) / len(a_symbols) if a_symbols else 0
         w_each_h = self.capital_split / len(h_symbols) if h_symbols else 0
         targets = {
             **{s: w_each_a for s in a_symbols},
             **{s: w_each_h for s in h_symbols},
         }
-        price_symbols = sorted(set(list(targets.keys()) + list(broker.positions.keys())))
+        price_symbols = sorted(
+            set(list(targets.keys()) + list(broker.positions.keys()))
+        )
         price_map = self._load_opens(bar.trade_date, price_symbols)
         if not price_map:
             return
         broker.rebalance_target_percents(bar.trade_date, price_map, targets)
         self._last_rebalance_quarter = quarter_key(bar.trade_date)
+        t1 = time.perf_counter()
+        print(
+            f"[AHPremiumQuarterlyStrategy] on_bar({bar.trade_date}) rebalance: {t1-t0:.3f}s"
+        )
