@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Quarterly A/H premium mean-reversion allocation strategy.
+"""Quarterly (configurable) A/H premium mean-reversion allocation strategy.
 
 Idea:
   - Universe: A/H dual-listed pairs defined in data/ah_codes.csv (already used in ah_premium processing)
@@ -36,7 +36,7 @@ Note: feed bars drive the calendar; actual traded symbols are updated via mark_p
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Sequence
+from typing import List, Dict, Optional, Sequence, Any
 import duckdb
 from ..backtester.data import Bar, DataFeed
 from ..backtester.broker import Broker
@@ -50,6 +50,10 @@ class PremiumRecord:
     cn_code: str
     hk_code: str
     premium_pct: float
+    a_close_raw: float  # A股原始收盘价 (CNY)
+    h_close_raw_cny: float  # H股原始收盘价(已换算CNY)
+    a_close_adj: float  # A股复权价(以统一基准因子归一)
+    h_close_adj_cny: float  # H股复权价(换算CNY, 以统一基准因子归一)
 
 
 def quarter_key(date_str: str) -> str:
@@ -70,6 +74,8 @@ class AHPremiumQuarterlyStrategy:
         capital_split: float = 0.5,
         price_cache_days: int = 30,
         use_adjusted: bool = True,
+        premium_use_adjusted: bool = False,  # 溢价计算是否使用复权价
+        rebalance_month_interval: int = 3,
     ):
         t0 = time.perf_counter()
         self.dbp = db_path_processed
@@ -80,13 +86,22 @@ class AHPremiumQuarterlyStrategy:
         self.capital_split = capital_split
         self.price_cache_days = price_cache_days
         self.use_adjusted = use_adjusted
+        self.premium_use_adjusted = premium_use_adjusted
+        self.rebalance_month_interval = (
+            rebalance_month_interval if rebalance_month_interval > 0 else 3
+        )
         self._last_rebalance_quarter: Optional[str] = None
+        self._last_rebalance_period: Optional[str] = None
         self._latest_premium_date: Optional[str] = None
         self._open_cache: Dict[str, Dict[str, float]] = {}
         self._fx_cache: Dict[str, float] = {}
         self._max_adj_a: Dict[str, float] = {}
         self._max_adj_h: Dict[str, float] = {}
-        if self.use_adjusted:
+        # per-symbol last adj_factor 基准
+        self._base_adj_a: Dict[str, float] = {}
+        self._base_adj_h: Dict[str, float] = {}
+        self.rebalance_history: List[Dict[str, Any]] = []
+        if self.use_adjusted or self.premium_use_adjusted:
             con = duckdb.connect(self.dbr, read_only=True)
             for row in con.execute(
                 "SELECT ts_code, MAX(adj_factor) FROM adj_factor_a GROUP BY ts_code"
@@ -96,11 +111,34 @@ class AHPremiumQuarterlyStrategy:
                 "SELECT ts_code, MAX(adj_factor) FROM adj_factor_h GROUP BY ts_code"
             ).fetchall():
                 self._max_adj_h[row[0]] = float(row[1])
+            # 由每个 symbol 自身最后一个交易日的 adj_factor 作为 base
+            for row in con.execute(
+                """
+                SELECT a.ts_code, a.adj_factor
+                FROM adj_factor_a a
+                JOIN (SELECT ts_code, MAX(trade_date) AS last_date FROM adj_factor_a GROUP BY ts_code) t
+                  ON a.ts_code=t.ts_code AND a.trade_date=t.last_date
+                """
+            ).fetchall():
+                self._base_adj_a[row[0]] = float(row[1])
+            for row in con.execute(
+                """
+                SELECT h.ts_code, h.adj_factor
+                FROM adj_factor_h h
+                JOIN (SELECT ts_code, MAX(trade_date) AS last_date FROM adj_factor_h GROUP BY ts_code) t
+                  ON h.ts_code=t.ts_code AND h.trade_date=t.last_date
+                """
+            ).fetchall():
+                self._base_adj_h[row[0]] = float(row[1])
             con.close()
         t1 = time.perf_counter()
         print(
-            f"[AHPremiumQuarterlyStrategy] __init__ preload max_adj_factor: {t1-t0:.3f}s"
+            f"[AHPremiumQuarterlyStrategy] __init__ preload factors: {t1-t0:.3f}s (premium_use_adjusted={self.premium_use_adjusted}, interval={self.rebalance_month_interval}m, base=per-symbol-last)"
         )
+
+    # 提供给 notebook: 全量再平衡历史
+    def get_rebalance_history(self) -> List[Dict[str, Any]]:
+        return self.rebalance_history
 
     # --- FX helpers ---------------------------------------------------
     def _load_hk_to_cny_rate(self, trade_date: str) -> Optional[float]:
@@ -151,18 +189,14 @@ class AHPremiumQuarterlyStrategy:
         ).fetchall()
         a_codes = [row[1] for row in mapping]
         h_codes = [row[2] for row in mapping]
-        a_raw = {
-            row[0]: (float(row[1]), float(row[2]))
-            for row in con.execute(
-                f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_codes])})"
-            ).fetchall()
-        }
-        h_raw = {
-            row[0]: (float(row[1]), float(row[2]))
-            for row in con.execute(
-                f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_codes])})"
-            ).fetchall()
-        }
+        a_rows = con.execute(
+            f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_codes])})"
+        ).fetchall()
+        h_rows = con.execute(
+            f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_codes])})"
+        ).fetchall()
+        a_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in a_rows}
+        h_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in h_rows}
         fx_row = con.execute(
             f"SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDCNH.FXCM' AND trade_date='{trade_date}'"
         ).fetchone()
@@ -179,38 +213,69 @@ class AHPremiumQuarterlyStrategy:
             )
             return []
         hk_to_cny = usd_cnh_mid / usd_hkd_mid if usd_hkd_mid else None
-        recs = []
+        recs: List[PremiumRecord] = []
         for name, cn_code, hk_code in mapping:
-            if cn_code not in a_raw or hk_code not in h_raw:
+            if cn_code not in a_raw_map or hk_code not in h_raw_map:
                 continue
-            close_a, adj_a = a_raw[cn_code]
-            close_h, adj_h = h_raw[hk_code]
-            max_af_a = self._max_adj_a.get(cn_code, 1.0)
-            max_af_h = self._max_adj_h.get(hk_code, 1.0)
-            close_a_fq = close_a * adj_a / max_af_a
-            close_h_hkd_fq = close_h * adj_h / max_af_h
-            close_h_cny_fq = close_h_hkd_fq * hk_to_cny if hk_to_cny else None
-            if close_h_cny_fq and close_h_cny_fq != 0:
-                premium_pct = (close_a_fq / close_h_cny_fq - 1) * 100
-                recs.append(
-                    PremiumRecord(trade_date, name, cn_code, hk_code, premium_pct)
+            close_a_raw, adj_a = a_raw_map[cn_code]
+            close_h_raw_hkd, adj_h = h_raw_map[hk_code]
+            # 原始价格(换算CNY后)
+            h_close_raw_cny = close_h_raw_hkd * hk_to_cny if hk_to_cny else None
+            if h_close_raw_cny is None or h_close_raw_cny == 0:
+                continue
+            # 复权（统一基准：latest date 的 adj_factor）
+            base_a = self._base_adj_a.get(cn_code) or self._max_adj_a.get(cn_code, 1.0)
+            base_h = self._base_adj_h.get(hk_code) or self._max_adj_h.get(hk_code, 1.0)
+            if not base_a:
+                base_a = 1.0
+            if not base_h:
+                base_h = 1.0
+            a_close_adj = close_a_raw * adj_a / base_a
+            h_close_adj_cny = (
+                (close_h_raw_hkd * adj_h / base_h) * hk_to_cny if hk_to_cny else None
+            )
+            if h_close_adj_cny is None or h_close_adj_cny == 0:
+                continue
+            # 溢价：根据用户参数决定使用 raw 还是 adj
+            if self.premium_use_adjusted:
+                premium_pct = (a_close_adj / h_close_adj_cny - 1) * 100
+            else:
+                premium_pct = (close_a_raw / h_close_raw_cny - 1) * 100
+            recs.append(
+                PremiumRecord(
+                    trade_date,
+                    name,
+                    cn_code,
+                    hk_code,
+                    premium_pct,
+                    close_a_raw,
+                    h_close_raw_cny,
+                    a_close_adj,
+                    h_close_adj_cny,
                 )
+            )
         t1 = time.perf_counter()
         print(
-            f"[AHPremiumQuarterlyStrategy] _load_premium_for_date({trade_date}): {t1-t0:.3f}s, {len(recs)} records"
+            f"[AHPremiumQuarterlyStrategy] _load_premium_for_date({trade_date}): {t1-t0:.3f}s, {len(recs)} records (premium_use_adjusted={self.premium_use_adjusted})"
         )
         if recs:
             self._latest_premium_date = recs[0].trade_date
         return recs
 
-    def _is_quarter_rebalance_day(self, bar: Bar, feed: DataFeed) -> bool:
+    def _period_key(self, date_str: str) -> str:
+        y = date_str[:4]
+        m = int(date_str[4:6])
+        p = (m - 1) // self.rebalance_month_interval
+        return f"{y}P{p}"
+
+    def _is_quarter_rebalance_day(
+        self, bar: Bar, feed: DataFeed
+    ) -> bool:  # 保留旧名以避免其他引用出错
         if bar.trade_date < self.start_date:
             return False
-        qk = quarter_key(bar.trade_date)
-        if qk != self._last_rebalance_quarter:
-            # ensure first day of that quarter in the feed timeline
-            # previous bar not same quarter
-            if feed.prev is None or quarter_key(feed.prev.trade_date) != qk:
+        pk = self._period_key(bar.trade_date)
+        if pk != self._last_rebalance_period:
+            if feed.prev is None or self._period_key(feed.prev.trade_date) != pk:
                 return True
         return False
 
@@ -230,8 +295,13 @@ class AHPremiumQuarterlyStrategy:
                 f"SELECT ts_code, open, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
             ).fetchall()
             for ts, open_, adj in rows:
-                max_af = self._max_adj_a.get(ts, 1.0)
-                res[ts] = float(open_) * float(adj) / max_af
+                if self.use_adjusted:
+                    base = self._base_adj_a.get(ts) or self._max_adj_a.get(ts, 1.0)
+                    if base == 0:
+                        base = 1.0
+                    res[ts] = float(open_) * float(adj) / base
+                else:
+                    res[ts] = float(open_)
         if h_syms:
             rows = con.execute(
                 f"SELECT ts_code, open, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
@@ -245,13 +315,19 @@ class AHPremiumQuarterlyStrategy:
                 )
                 return {}
             for ts, open_, adj in rows:
-                max_af = self._max_adj_h.get(ts, 1.0)
-                res[ts] = float(open_) * float(adj) / max_af * rate
+                if self.use_adjusted:
+                    base = self._base_adj_h.get(ts) or self._max_adj_h.get(ts, 1.0)
+                    if base == 0:
+                        base = 1.0
+                    local = float(open_) * float(adj) / base
+                else:
+                    local = float(open_)
+                res[ts] = local * rate
         con.close()
         self._open_cache.setdefault(trade_date, {}).update(res)
         t1 = time.perf_counter()
         print(
-            f"[AHPremiumQuarterlyStrategy] _load_opens({trade_date}): {t1-t0:.3f}s, {len(res)} symbols"
+            f"[AHPremiumQuarterlyStrategy] _load_opens({trade_date}): {t1-t0:.3f}s, {len(res)} symbols (use_adjusted={self.use_adjusted})"
         )
         return res
 
@@ -269,8 +345,13 @@ class AHPremiumQuarterlyStrategy:
                 f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
             ).fetchall()
             for ts, close_, adj in rows:
-                max_af = self._max_adj_a.get(ts, 1.0)
-                res[ts] = float(close_) * float(adj) / max_af
+                if self.use_adjusted:
+                    base = self._base_adj_a.get(ts) or self._max_adj_a.get(ts, 1.0)
+                    if base == 0:
+                        base = 1.0
+                    res[ts] = float(close_) * float(adj) / base
+                else:
+                    res[ts] = float(close_)
         if h_syms:
             rows = con.execute(
                 f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
@@ -280,8 +361,14 @@ class AHPremiumQuarterlyStrategy:
                 con.close()
                 return {}
             for ts, close_, adj in rows:
-                max_af = self._max_adj_h.get(ts, 1.0)
-                res[ts] = float(close_) * float(adj) / max_af * rate
+                if self.use_adjusted:
+                    base = self._base_adj_h.get(ts) or self._max_adj_h.get(ts, 1.0)
+                    if base == 0:
+                        base = 1.0
+                    local = float(close_) * float(adj) / base
+                else:
+                    local = float(close_)
+                res[ts] = local * rate
         con.close()
         return res
 
@@ -315,9 +402,60 @@ class AHPremiumQuarterlyStrategy:
         price_map = self._load_opens(bar.trade_date, price_symbols)
         if not price_map:
             return
+        # --- 记录与输出决策 (包含原始价/复权价) ---
+        decisions: List[Dict[str, Any]] = []
+        for rec in bottom:
+            decisions.append(
+                {
+                    "symbol": rec.cn_code,
+                    "leg": "A",
+                    "pair_name": rec.name,
+                    "cn_code": rec.cn_code,
+                    "hk_code": rec.hk_code,
+                    "premium_pct": rec.premium_pct,
+                    "target_weight": w_each_a,
+                    "a_close_raw": rec.a_close_raw,
+                    "h_close_raw_cny": rec.h_close_raw_cny,
+                    "a_close_adj": rec.a_close_adj,
+                    "h_close_adj_cny": rec.h_close_adj_cny,
+                }
+            )
+        for rec in top:
+            decisions.append(
+                {
+                    "symbol": rec.hk_code,
+                    "leg": "H",
+                    "pair_name": rec.name,
+                    "cn_code": rec.cn_code,
+                    "hk_code": rec.hk_code,
+                    "premium_pct": rec.premium_pct,
+                    "target_weight": w_each_h,
+                    "a_close_raw": rec.a_close_raw,
+                    "h_close_raw_cny": rec.h_close_raw_cny,
+                    "a_close_adj": rec.a_close_adj,
+                    "h_close_adj_cny": rec.h_close_adj_cny,
+                }
+            )
+        self.rebalance_history.append(
+            {
+                "rebalance_date": bar.trade_date,
+                "premium_date": prev_bar.trade_date,
+                "decisions": decisions,
+            }
+        )
+        print(
+            f"[AHPremiumQuarterlyStrategy] rebalance {bar.trade_date} premium_date={prev_bar.trade_date} A_count={len(a_symbols)} H_count={len(h_symbols)}"
+        )
+        for d in decisions:
+            print(
+                "  symbol={symbol} leg={leg} prem={premium_pct:.2f}% wt={target_weight:.4f} "
+                "A_raw={a_close_raw:.4f} H_raw={h_close_raw_cny:.4f} A_adj={a_close_adj:.4f} H_adj={h_close_adj_cny:.4f} pair={pair_name}".format(
+                    **d
+                )
+            )
         broker.rebalance_target_percents(bar.trade_date, price_map, targets)
-        self._last_rebalance_quarter = quarter_key(bar.trade_date)
+        self._last_rebalance_period = self._period_key(bar.trade_date)
         t1 = time.perf_counter()
         print(
-            f"[AHPremiumQuarterlyStrategy] on_bar({bar.trade_date}) rebalance: {t1-t0:.3f}s"
+            f"[AHPremiumQuarterlyStrategy] on_bar({bar.trade_date}) rebalance done: {t1-t0:.3f}s"
         )
