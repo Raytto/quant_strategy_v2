@@ -375,6 +375,37 @@ class AHPremiumQuarterlyStrategy:
     # --- core event ----------------------------------------------------
     def on_bar(self, bar: Bar, feed: DataFeed, broker: Broker):
         t0 = time.perf_counter()
+        # 先检查已持仓标的是否在今日之后退市(或今日即退市)，若退市则按 0 价值核销
+        if broker.positions:
+            try:
+                con = duckdb.connect(self.dbr, read_only=True)
+                # 查询 A / H 基础表的 delist_date
+                held_syms = list(broker.positions.keys())
+                # 拆分 A/H
+                a_syms = [
+                    s for s in held_syms if s.endswith(".SH") or s.endswith(".SZ")
+                ]
+                h_syms = [s for s in held_syms if s.endswith(".HK")]
+                rows: list[tuple[str, Optional[str]]] = []
+                if a_syms:
+                    q_a = f"SELECT ts_code, delist_date FROM stock_basic_a WHERE ts_code IN ({','.join([repr(x) for x in a_syms])})"
+                    rows += con.execute(q_a).fetchall()
+                if h_syms:
+                    q_h = f"SELECT ts_code, delist_date FROM stock_basic_h WHERE ts_code IN ({','.join([repr(x) for x in h_syms])})"
+                    rows += con.execute(q_h).fetchall()
+                con.close()
+                for ts_code, delist_date in rows:
+                    if (
+                        delist_date
+                        and delist_date != ""
+                        and delist_date <= bar.trade_date
+                    ):
+                        # 退市：强制清零
+                        broker.force_write_off(
+                            bar.trade_date, ts_code, reason=f"delist@{delist_date}"
+                        )
+            except Exception as e:
+                print(f"[AHPremiumQuarterlyStrategy] delist check error: {e}")
         if not self._is_quarter_rebalance_day(bar, feed):
             return
         prev_bar = feed.prev

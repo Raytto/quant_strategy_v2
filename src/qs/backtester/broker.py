@@ -16,13 +16,13 @@ class Position:
 @dataclass
 class TradeRecord:
     trade_date: str
-    action: str  # BUY / SELL
+    action: str  # BUY / SELL / WRITE_OFF
     symbol: str  # 交易标的代码
-    price: float  # 原始信号价(开盘价)
-    exec_price: float  # 含滑点执行价
+    price: float  # 原始信号价(开盘价) / 或写入 0 (WRITE_OFF)
+    exec_price: float  # 含滑点执行价 / 0 (WRITE_OFF)
     size: float
-    gross_amount: float  # 买入=成交金额  卖出=成交金额
-    fees: float  # 佣金(+卖出印花税)
+    gross_amount: float  # 买入=成交金额  卖出=成交金额 / 0
+    fees: float  # 佣金(+卖出印花税) / 0
     cash_after: float
     position_after: float
     equity_after: float
@@ -129,6 +129,36 @@ class Broker:
                 f"size={record.size:.0f} gross={record.gross_amount:.2f} fees={record.fees:.2f} "
                 f"cash={record.cash_after:.2f} pos={record.position_after:.0f} eq={record.equity_after:.2f}"
             )
+
+    # -------------------- 强制核销 (退市/清零) ---------------------------------
+    def force_write_off(self, trade_date: str, symbol: str, reason: str = "delist"):
+        """将持仓按 0 价值核销，不收取费用，记录一条 WRITE_OFF 交易。"""
+        pos = self.positions.get(symbol)
+        if not pos or pos.size <= 0:
+            return 0
+        size = int(pos.size)
+        # 价值归零
+        self.last_prices[symbol] = 0.0
+        pos.size = 0
+        pos.avg_price = 0.0
+        eq = self.total_equity()
+        rec = TradeRecord(
+            trade_date,
+            "WRITE_OFF",
+            symbol,
+            0.0,
+            0.0,
+            size,
+            0.0,
+            0.0,
+            self.cash,  # 现金不变
+            0,
+            eq,
+        )
+        self._log_trade(rec)
+        if self.enable_trade_log:
+            print(f"WRITE_OFF {symbol} at {trade_date} reason={reason}")
+        return size
 
     # ------------------------------------------------------------------
     # Internal execution helpers (symbol-aware)
