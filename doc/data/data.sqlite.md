@@ -1,6 +1,6 @@
-# DuckDB 数据库总览与 LLM 使用指南 (`data/data.duckdb`)
+# SQLite 数据库总览与 LLM 使用指南 (`data/data.sqlite`)
 
-本文件汇总所有已由同步脚本写入 DuckDB 的核心结构与语义，整合自:
+本文件汇总所有已由同步脚本写入 SQLite 的核心结构与语义，整合自:
 - 基础列表同步: `tushare_sync_basic.py` (文档: `tushare_sync_basic.md`)
 - 多市场日频同步: `tushare_sync_daily.py` (文档: `tushare_sync_daily.md`)
 

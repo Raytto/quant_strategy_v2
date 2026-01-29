@@ -1,7 +1,7 @@
 # A/H 溢价计算脚本说明 (`ah_premium.py`)
 
 脚本位置: `src/data_processor/ah_premium.py`
-输出库: `data/data_processed.duckdb`
+输出库: `data/data_processed.sqlite`
 输出表: `ah_premium`
 
 ## 1. 目标
@@ -18,9 +18,9 @@ premium_pct   = (premium_ratio - 1) * 100
 ## 2. 上游依赖
 | 数据 | 来源 | 说明 |
 |------|------|------|
-| daily_a | `data/data.duckdb` | A 股日线 (收盘价 RMB) |
-| daily_h | `data/data.duckdb` | 港股日线 (收盘价 HKD) |
-| fx_daily | `data/data.duckdb` | 汇率 (需含 `USDCNH.FXCM` 与 `USDHKD.FXCM`) |
+| daily_a | `data/data.sqlite` | A 股日线 (收盘价 RMB) |
+| daily_h | `data/data.sqlite` | 港股日线 (收盘价 HKD) |
+| fx_daily | `data/data.sqlite` | 汇率 (需含 `USDCNH.FXCM` 与 `USDHKD.FXCM`) |
 | ah_codes.csv | `data/ah_codes.csv` | A/H 对应映射 (name, cn_code, hk_code) |
 
 缺失任一组成部分的交易日/股票将被跳过 (不插入行)。
@@ -54,7 +54,7 @@ python -m data_processor.ah_premium --append
 ```
 指定自定义路径:
 ```
-python -m data_processor.ah_premium --source-db data/data.duckdb --output-db data/data_processed.duckdb --ah-csv data/ah_codes.csv
+python -m data_processor.ah_premium --source-db data/data.sqlite --output-db data/data_processed.sqlite --ah-csv data/ah_codes.csv
 ```
 
 ## 5. 追加与重建策略
@@ -62,16 +62,15 @@ python -m data_processor.ah_premium --source-db data/data.duckdb --output-db dat
 - `--append`: 读取现有最大 trade_date, 仅追加更晚日期。若上游发生历史修订需再次全量重建。
 
 ## 6. 常见分析示例
-最近 20 日溢价 Z 分数:
+最近 20 日溢价滚动均值（示例）:
 ```sql
 WITH base AS (
   SELECT cn_code, trade_date, premium_pct,
-         AVG(premium_pct) OVER w AS ma,
-         STDDEV(premium_pct) OVER w AS sd
+         AVG(premium_pct) OVER w AS ma
   FROM ah_premium
   WINDOW w AS (PARTITION BY cn_code ORDER BY trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW)
 )
-SELECT *, (premium_pct - ma)/NULLIF(sd,0) AS z
+SELECT *, (premium_pct - ma) AS prem_minus_ma
 FROM base
 WHERE trade_date >= '20250101';
 ```

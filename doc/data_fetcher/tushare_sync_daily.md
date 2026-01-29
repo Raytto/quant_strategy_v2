@@ -1,7 +1,7 @@
 # 多市场日频数据统一同步说明 (fx_daily / daily_a / adj_factor_a / bak_daily_a / daily_h / adj_factor_h / index_daily / index_global)
 
 对应统一脚本: `src/data_fetcher/tushare_sync_daily.py`
-目标 DuckDB 数据库: `data/data.duckdb`
+目标 SQLite 数据库: `data/data.sqlite`
 辅助控制表: `sync_date` (增量进度)
 
 涵盖数据来源 (TuShare 接口 / 官方文档 doc_id):
@@ -110,7 +110,7 @@ SELECT trade_date, close FROM index_daily WHERE ts_code='000300.SH' ORDER BY tra
 SELECT a.trade_date,
        h.pct_chg AS hsi_pct,
        n.pct_chg AS ixic_pct
-FROM (SELECT DISTINCT trade_date FROM index_global WHERE trade_date>=strftime('%Y%m%d', DATE 'now' - INTERVAL 15 DAY)) a
+FROM (SELECT DISTINCT trade_date FROM index_global WHERE trade_date>=strftime('%Y%m%d', date('now','-15 day'))) a
 LEFT JOIN index_global h ON a.trade_date=h.trade_date AND h.ts_code='HSI'
 LEFT JOIN index_global n ON a.trade_date=n.trade_date AND n.ts_code='IXIC'
 ORDER BY a.trade_date DESC LIMIT 10;

@@ -31,17 +31,20 @@
 4. 多市场一致性校验：行业轮动、资金流向差异。
 
 ---
-## 4. 示例查询 (DuckDB)
-### 4.1 计算最近 60 日 A/H 收盘价比值 (未汇率折算)
+## 4. 示例查询 (SQLite)
+
+> 前提：先将 `data/ah_codes.csv` 导入到 SQLite 的 `ah_codes` 表（示例见文末）。
+
+### 4.1 计算指定起始日以来 A/H 收盘价比值 (未汇率折算)
 ```sql
 WITH ah AS (
   SELECT a.trade_date, m.cn_code, m.hk_code,
          a.close AS close_a,
          h.close AS close_h
-  FROM read_csv_auto('data/ah_codes.csv') m
+  FROM ah_codes m
   JOIN daily_a a ON a.ts_code = m.cn_code
   JOIN daily_h h ON h.ts_code = m.hk_code AND h.trade_date = a.trade_date
-  WHERE a.trade_date >= strftime(date_sub(current_date, INTERVAL 60 DAY), '%Y%m%d')
+  WHERE a.trade_date >= '20240101'
 )
 SELECT *, close_a / NULLIF(close_h,0) AS a_h_ratio
 FROM ah
@@ -61,7 +64,7 @@ WITH rate AS (
   SELECT m.cn_code, m.hk_code, a.trade_date,
          a.close AS close_a,
          k.close_h_cny
-  FROM read_csv_auto('data/ah_codes.csv') m
+  FROM ah_codes m
   JOIN daily_a a ON a.ts_code = m.cn_code
   JOIN hk_cny k ON k.ts_code = m.hk_code AND k.trade_date = a.trade_date
 )
@@ -73,7 +76,7 @@ ORDER BY trade_date, cn_code;
 ### 4.3 缺少对应行情的对照检查
 ```sql
 SELECT m.*
-FROM read_csv_auto('data/ah_codes.csv') m
+FROM ah_codes m
 LEFT JOIN daily_a a ON a.ts_code = m.cn_code
 LEFT JOIN daily_h h ON h.ts_code = m.hk_code
 WHERE a.ts_code IS NULL OR h.ts_code IS NULL;
@@ -108,12 +111,9 @@ WHERE a.ts_code IS NULL OR h.ts_code IS NULL;
 - “如需实时对照，请基于最新基础表按名称/ISIN 重新匹配生成。”
 
 ---
-若要将本清单结构化落库，可导入 DuckDB：
+若要将本清单结构化落库，可导入 SQLite（sqlite3 CLI 示例）：
 ```sql
-CREATE OR REPLACE TABLE ah_codes AS
-SELECT * FROM read_csv_auto('data/ah_codes.csv');
-```
-之后可创建唯一约束模拟 (DuckDB 0.9+ 支持 UNIQUE 索引)：
-```sql
-CREATE UNIQUE INDEX ah_codes_uq ON ah_codes(cn_code, hk_code);
+.mode csv
+.import data/ah_codes.csv ah_codes
+CREATE UNIQUE INDEX IF NOT EXISTS ah_codes_uq ON ah_codes(cn_code, hk_code);
 ```

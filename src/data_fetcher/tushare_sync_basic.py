@@ -1,19 +1,21 @@
 """
 文件: tushare_sync_basic.py
-功能: 可配置地同步 A / H 股（及 FX 外汇基础）列表至 DuckDB，并在导入时保证 INFO 日志可见。
+功能: 可配置地同步 A / H 股（及 FX 外汇基础）列表至 SQLite，并在导入时保证 INFO 日志可见。
 新增: fx_basic (TuShare 接口 fx_obasic, doc_id=178) 动态外汇代码池供 fx_daily 使用。
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-import duckdb
 import pandas as pd
 import tushare as ts
+
+from qs.sqlite_utils import connect_sqlite, ensure_unique_index, insert_df_ignore, table_exists
 
 # ----------------------------------------------------------------------
 # 日志：若根 logger 尚未配置，立即设置成 INFO，确保被 import 调用时也能打印
@@ -25,16 +27,14 @@ if not logging.getLogger().handlers:
     )
 
 # ----------------------------------------------------------------------
-# 读取加密配置（settings.tushare_api_token: SecretStr）
+# 读取配置
 # ----------------------------------------------------------------------
-from data_fetcher.settings import settings
-
-TS_TOKEN = settings.tushare_api_token.get_secret_value()
+from data_fetcher.settings import get_tushare_token
 
 # ----------------------------------------------------------------------
 # 通用常量
 # ----------------------------------------------------------------------
-DUCKDB_PATH = Path("data/data.duckdb")
+SQLITE_PATH = Path("data/data.sqlite")
 LIMIT = 3000
 MAX_RETRY = 3
 SLEEP = 0.6  # 等价于每分钟 ~100 次调用
@@ -159,35 +159,33 @@ def _fetch_table(
         time.sleep(SLEEP)
 
 
-def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
-    return table in {row[0] for row in con.execute("SHOW TABLES").fetchall()}
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    return table_exists(con, table)
 
 
 def _upsert(df: pd.DataFrame, table: str) -> int:
-    DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(DUCKDB_PATH))
-
-    if not _table_exists(con, table):
-        con.register("dfv", df)
-        con.execute(f"CREATE TABLE {table} AS SELECT * FROM dfv")
-        logging.info("新建表 %s 写入 %s 行", table, len(df))
-    else:
-        if "ts_code" in df.columns:
-            existing = (
-                con.execute(f"SELECT ts_code FROM {table}").fetchdf().ts_code.unique()
-            )
-            new_rows = df[~df.ts_code.isin(existing)]
-        else:
-            new_rows = df
-        if new_rows.empty:
+    con = connect_sqlite(SQLITE_PATH)
+    try:
+        if not table_exists(con, table):
+            df.head(0).to_sql(table, con, if_exists="fail", index=False)
+            if "ts_code" in df.columns:
+                ensure_unique_index(
+                    con, table=table, columns=["ts_code"], index_name=f"{table}_uq"
+                )
+        inserted = insert_df_ignore(
+            con,
+            df=df,
+            table=table,
+            unique_by=["ts_code"] if "ts_code" in df.columns else None,
+        )
+        if inserted == 0:
             logging.info("%s 已最新 无新增", table)
         else:
-            con.register("new_rows", new_rows)
-            con.execute(f"INSERT INTO {table} SELECT * FROM new_rows")
-            logging.info("%s 插入 %s 行", table, len(new_rows))
-
-    cnt = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    con.close()
+            logging.info("%s 插入 %s 行", table, inserted)
+        cnt = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        con.commit()
+    finally:
+        con.close()
     return cnt
 
 
@@ -197,7 +195,7 @@ def _upsert(df: pd.DataFrame, table: str) -> int:
 
 
 def data_sync() -> None:
-    pro = ts.pro_api(TS_TOKEN)
+    pro = ts.pro_api(get_tushare_token())
     for name, cfg in MARKET_CONFIG.items():
         df = _fetch_table(pro, cfg["api_name"], cfg["params"], cfg["fields"])
         cnt = _upsert(df, cfg["table"])

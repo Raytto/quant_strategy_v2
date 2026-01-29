@@ -1,12 +1,13 @@
-import duckdb
 from pathlib import Path
 
-DB_PATH = Path("data/data.duckdb")
+from qs.sqlite_utils import connect_sqlite
+
+DB_PATH = Path("data/data.sqlite")
 if not DB_PATH.exists():
     print("数据库文件不存在:", DB_PATH)
     raise SystemExit(1)
 
-con = duckdb.connect(str(DB_PATH))
+con = connect_sqlite(DB_PATH, read_only=True)
 try:
     row = con.execute(
         "SELECT MIN(trade_date), MAX(trade_date), COUNT(*) FROM fx_daily WHERE ts_code='USDCNH.FXCM'"

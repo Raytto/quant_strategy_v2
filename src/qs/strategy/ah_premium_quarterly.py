@@ -5,7 +5,7 @@ from __future__ import annotations
 Idea:
   - Universe: A/H dual-listed pairs defined in data/ah_codes.csv (already used in ah_premium processing)
   - For each quarter start trading day (first trading day whose month in {1,4,7,10} and previous bar month != current or prev date < start date),
-      * Look at latest available premium snapshot (table ah_premium in data_processed.duckdb) for previous trading day.
+      * Look at latest available premium snapshot (table ah_premium in data_processed.sqlite) for previous trading day.
       * Rank by premium_pct (A over H premium). Higher premium means A >> H relative (A expensive). We buy H (expect convergence) on high premium side.
       * Lowest premium (A cheap vs H) -> buy A.
       * Capital split: 50% allocated to top_k H-leg symbols equally; 50% to bottom_k A-leg symbols equally.
@@ -19,15 +19,15 @@ Simplifications:
   - 货币换算: H 股价格以 HKD 报价, 回测资金以 CNY 计价。这里按 fx_daily 中 USD/CNH 与 USD/HKD 交叉得到 HKD→CNY 汇率, 对 H 股 open/close 做换算; 若当日缺失, 取最近不晚于 trade_date 的可用汇率。否则跳过再平衡以避免混合币种。
 
 Dependencies:
-  - DuckDB file data/data_processed.duckdb (table ah_premium)
+  - SQLite file data/data_processed.sqlite (table ah_premium)
   - Price provider capable of returning today's open for arbitrary symbol (A or H) for `price_map`.
   - fx_daily: ts_code IN ('USDCNH.FXCM','USDHKD.FXCM').
 
 Usage in script:
   feed = DataFeed(bars_for_calendar_only) # can be a simple index daily bars to iterate trading days
   broker = Broker(cash=1_000_000, enable_trade_log=False)
-  strat = AHPremiumQuarterlyStrategy(db_path_processed='data/data_processed.duckdb',
-                                     db_path_raw='data/data.duckdb',
+  strat = AHPremiumQuarterlyStrategy(db_path_processed='data/data_processed.sqlite',
+                                     db_path_raw='data/data.sqlite',
                                      top_k=5, bottom_k=5)
   engine = BacktestEngine(feed, broker, strat)
   curve = engine.run()
@@ -37,7 +37,9 @@ Note: feed bars drive the calendar; actual traded symbols are updated via mark_p
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Sequence, Any
-import duckdb
+import csv
+
+from ..sqlite_utils import connect_sqlite
 from ..backtester.data import Bar, DataFeed
 from ..backtester.broker import Broker
 import time
@@ -66,8 +68,8 @@ def quarter_key(date_str: str) -> str:
 class AHPremiumQuarterlyStrategy:
     def __init__(
         self,
-        db_path_processed: str = "data/data_processed.duckdb",
-        db_path_raw: str = "data/data.duckdb",
+        db_path_processed: str = "data/data_processed.sqlite",
+        db_path_raw: str = "data/data.sqlite",
         top_k: int = 5,
         bottom_k: int = 5,
         start_date: str = "20180101",
@@ -102,7 +104,7 @@ class AHPremiumQuarterlyStrategy:
         self._base_adj_h: Dict[str, float] = {}
         self.rebalance_history: List[Dict[str, Any]] = []
         if self.use_adjusted or self.premium_use_adjusted:
-            con = duckdb.connect(self.dbr, read_only=True)
+            con = connect_sqlite(self.dbr, read_only=True)
             for row in con.execute(
                 "SELECT ts_code, MAX(adj_factor) FROM adj_factor_a GROUP BY ts_code"
             ).fetchall():
@@ -144,7 +146,7 @@ class AHPremiumQuarterlyStrategy:
     def _load_hk_to_cny_rate(self, trade_date: str) -> Optional[float]:
         if trade_date in self._fx_cache:
             return self._fx_cache[trade_date]
-        con = duckdb.connect(self.dbr, read_only=True)
+        con = connect_sqlite(self.dbr, read_only=True)
         # find latest date <= trade_date having both rates
         q = f"""
         WITH d AS (
@@ -175,18 +177,27 @@ class AHPremiumQuarterlyStrategy:
     # --- data helpers -------------------------------------------------
     def _load_premium_for_date(self, trade_date: str) -> List[PremiumRecord]:
         t0 = time.perf_counter()
-        hk_col = "hk_code"
-        try:
-            with open("data/ah_codes.csv", "r", encoding="utf-8") as f:
-                header = f.readline().strip().split(",")
-            if "hk_code" not in header and "c" in header:
+        mapping: list[tuple[str, str, str]] = []
+        with open("data/ah_codes.csv", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return []
+            if "hk_code" in reader.fieldnames:
+                hk_col = "hk_code"
+            elif "c" in reader.fieldnames:
                 hk_col = "c"
-        except Exception:
-            pass
-        con = duckdb.connect(self.dbr, read_only=True)
-        mapping = con.execute(
-            f"SELECT name, cn_code, {hk_col} AS hk_code FROM read_csv_auto('data/ah_codes.csv')"
-        ).fetchall()
+            else:
+                raise RuntimeError(
+                    "ah_codes.csv missing hk_code column (expected hk_code or c)"
+                )
+            for row in reader:
+                cn_code = (row.get("cn_code") or "").strip()
+                hk_code = (row.get(hk_col) or "").strip()
+                if not cn_code or not hk_code:
+                    continue
+                mapping.append(((row.get("name") or "").strip(), cn_code, hk_code))
+
+        con = connect_sqlite(self.dbr, read_only=True)
         a_codes = [row[1] for row in mapping]
         h_codes = [row[2] for row in mapping]
         a_rows = con.execute(
@@ -286,7 +297,7 @@ class AHPremiumQuarterlyStrategy:
             cache = self._open_cache[trade_date]
             if all(s in cache for s in symbols):
                 return {s: cache[s] for s in symbols}
-        con = duckdb.connect(self.dbr, read_only=True)
+        con = connect_sqlite(self.dbr, read_only=True)
         res: Dict[str, float] = {}
         a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
         h_syms = [s for s in symbols if s.endswith(".HK")]
@@ -336,7 +347,7 @@ class AHPremiumQuarterlyStrategy:
         symbols = list(broker.positions.keys())
         if not symbols:
             return {}
-        con = duckdb.connect(self.dbr, read_only=True)
+        con = connect_sqlite(self.dbr, read_only=True)
         res: Dict[str, float] = {}
         a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
         h_syms = [s for s in symbols if s.endswith(".HK")]
@@ -378,7 +389,7 @@ class AHPremiumQuarterlyStrategy:
         # 先检查已持仓标的是否在今日之后退市(或今日即退市)，若退市则按 0 价值核销
         if broker.positions:
             try:
-                con = duckdb.connect(self.dbr, read_only=True)
+                con = connect_sqlite(self.dbr, read_only=True)
                 # 查询 A / H 基础表的 delist_date
                 held_syms = list(broker.positions.keys())
                 # 拆分 A/H

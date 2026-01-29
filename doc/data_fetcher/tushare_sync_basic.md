@@ -1,6 +1,6 @@
 # A/H 股 + 外汇基础列表同步说明 (stock_basic_a / stock_basic_h / fx_basic)
 
-本文档对应脚本 `src/data_fetcher/tushare_sync_basic.py`，描述其向 DuckDB (`data/data.duckdb`) 建立与增量维护的三张基础资产维度表：
+本文档对应脚本 `src/data_fetcher/tushare_sync_basic.py`，描述其向 SQLite (`data/data.sqlite`) 建立与增量维护的三张基础资产维度表：
 - `stock_basic_a` : A 股基础信息（TuShare 接口 `stock_basic`, doc_id=25）
 - `stock_basic_h` : 港股基础信息（TuShare 接口 `hk_basic`, doc_id=191）
 - `fx_basic` : 外汇基础信息（TuShare 接口 `fx_obasic`, doc_id=178）
@@ -25,7 +25,7 @@
 ## 2. 参数与常量
 | 变量 | 含义 | 默认 |
 |------|------|------|
-| DUCKDB_PATH | DuckDB 数据库文件路径 | data/data.duckdb |
+| SQLITE_PATH | SQLite 数据库文件路径 | data/data.sqlite |
 | LIMIT | 每次分页拉取条数 | 3000 |
 | MAX_RETRY | 每页最大重试次数 | 3 |
 | SLEEP | 正常分页间隔 (秒) | 0.6 |
@@ -55,7 +55,7 @@
 | delist_date | 退市日期 (若退市) | 是 | (空/日期) |
 | is_hs | 是否沪/深港通标的 N/S/H | 是 | H |
 
-主键策略：逻辑上以 `ts_code` 唯一；脚本未显式创建主键约束（DuckDB 自动推断列）。
+主键策略：逻辑上以 `ts_code` 唯一；脚本会创建 `UNIQUE INDEX` 以保证幂等插入。
 
 ### 3.2 表：stock_basic_h (港股)
 来源：TuShare `hk_basic` (doc_id=191)。

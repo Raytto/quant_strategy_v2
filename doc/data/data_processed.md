@@ -1,6 +1,6 @@
-# 处理结果数据库 (`data/data_processed.duckdb`)
+# 处理结果数据库 (`data/data_processed.sqlite`)
 
-该数据库存放在原始行情基础数据 (`data/data.duckdb`) 之上派生的分析 / 因子 / 指标等结果表。当前已包含:
+该数据库存放在原始行情基础数据 (`data/data.sqlite`) 之上派生的分析 / 因子 / 指标等结果表。当前已包含:
 
 | 表名 | 主键 | 说明 | 上游依赖 |
 |------|------|------|----------|
@@ -31,7 +31,7 @@
 - 缺失策略: 任一组成部分缺失 (A/H 价格、两条汇率) 则该交易日该股票不入表。
 
 ### 1.2 与上游刷新关系
-- 每次运行 `ah_premium.py` (全量或追加) 读取当下 `data/data.duckdb` 最新数据。
+- 每次运行 `ah_premium.py` (全量或追加) 读取当下 `data/data.sqlite` 最新数据。
 - 若上游出现回溯修订，需要执行全量重建 (默认模式) 以重新计算历史。
 - 追加模式仅插入新日期 ( > 当前表内最大 trade_date )。
 
@@ -57,16 +57,15 @@ WHERE ABS(premium_pct) > 50
 ORDER BY ABS(premium_pct) DESC
 LIMIT 50;
 ```
-溢价均值回复信号 (简单 Z-Score):
+溢价均值回复信号 (简单滚动均值示例):
 ```sql
 WITH base AS (
   SELECT cn_code, trade_date, premium_pct,
-         AVG(premium_pct) OVER w AS ma,
-         STDDEV(premium_pct) OVER w AS sd
+         AVG(premium_pct) OVER w AS ma
   FROM ah_premium
   WINDOW w AS (PARTITION BY cn_code ORDER BY trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
 )
-SELECT *, (premium_pct - ma)/NULLIF(sd,0) AS z
+SELECT *, (premium_pct - ma) AS prem_minus_ma
 FROM base
 WHERE trade_date >= '20240101';
 ```

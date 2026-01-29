@@ -1,8 +1,8 @@
-import duckdb
+from qs.sqlite_utils import connect_sqlite
 
 
 def db_vacuum():
-    con = duckdb.connect(r"data/data.duckdb")
+    con = connect_sqlite("data/data.sqlite")
     con.execute("VACUUM")
     con.execute("ANALYZE")
     con.close()

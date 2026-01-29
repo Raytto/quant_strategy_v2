@@ -1,5 +1,7 @@
 from __future__ import annotations
-import duckdb
+
+import _bootstrap  # noqa: F401
+
 from pathlib import Path
 from qs.backtester.data import Bar, DataFeed
 from qs.backtester.broker import Broker
@@ -15,26 +17,31 @@ START_DATE = "20200101"
 A_CODE = "601628.SH"
 H_CODE = "02628.HK"
 INITIAL_CASH = 1_000_000.0
-SRC_DB = Path("data/data.duckdb")
+from qs.sqlite_utils import connect_sqlite, read_sql_df
 
-con = duckdb.connect(str(SRC_DB), read_only=True)
-a_df = con.execute(
+SRC_DB = Path("data/data.sqlite")
+
+con = connect_sqlite(SRC_DB, read_only=True)
+a_df = read_sql_df(
+    con,
     f"""
 SELECT trade_date, open, high, low, close, pct_chg
 FROM daily_a
 WHERE ts_code='{A_CODE}' AND trade_date >= '{START_DATE}'
 ORDER BY trade_date
 """
-).fetchdf()
+)
 
-h_df = con.execute(
+h_df = read_sql_df(
+    con,
     f"""
 SELECT trade_date, open, close, pct_chg
 FROM daily_h
 WHERE ts_code='{H_CODE}' AND trade_date >= '{START_DATE}'
 ORDER BY trade_date
 """
-).fetchdf()
+)
+con.close()
 
 h_open = {r.trade_date: r.open for r in h_df.itertuples(index=False)}
 h_pct = {r.trade_date: r.pct_chg for r in h_df.itertuples(index=False)}

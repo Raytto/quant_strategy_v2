@@ -1,5 +1,7 @@
 from __future__ import annotations
-import duckdb
+
+import _bootstrap  # noqa: F401
+
 import argparse
 from pathlib import Path
 from qs.backtester.data import Bar, DataFeed
@@ -16,7 +18,9 @@ START_DATE = "20200101"
 TS_CODE = "601628.SH"  # 中国人寿
 INITIAL_CASH = 1_000_000.0
 
-SRC_DB = Path("data/data.duckdb")
+from qs.sqlite_utils import connect_sqlite, read_sql_df
+
+SRC_DB = Path("data/data.sqlite")
 
 
 def parse_args():
@@ -28,15 +32,17 @@ def parse_args():
 args = parse_args()
 
 # 读取数据
-con = duckdb.connect(str(SRC_DB), read_only=True)
-df = con.execute(
+con = connect_sqlite(SRC_DB, read_only=True)
+df = read_sql_df(
+    con,
     f"""
 SELECT trade_date, open, high, low, close, pct_chg
 FROM daily_a
 WHERE ts_code='{TS_CODE}' AND trade_date >= '{START_DATE}'
 ORDER BY trade_date
 """
-).fetchdf()
+)
+con.close()
 
 bars = [
     Bar(r.trade_date, r.open, r.high, r.low, r.close, r.pct_chg)

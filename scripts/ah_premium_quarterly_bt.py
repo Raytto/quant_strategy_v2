@@ -8,14 +8,16 @@ Steps:
  3. Run engine, compute stats.
 
 Assumptions:
-  - Databases: data/data.duckdb (raw), data/data_processed.duckdb (processed with ah_premium table).
+  - Databases: data/data.sqlite (raw), data/data_processed.sqlite (processed with ah_premium table).
   - Ensure ah_premium table up-to-date covering test period (run its generator beforehand).
 
 CLI:
   python scripts/ah_premium_quarterly_bt.py --start 20180101 --top 5 --bottom 5 --cash 1000000
 """
+import _bootstrap  # noqa: F401
+
 import argparse
-import duckdb
+from qs.sqlite_utils import connect_sqlite
 from qs.backtester.data import Bar, DataFeed
 from qs.backtester.broker import Broker
 from qs.backtester.engine import BacktestEngine
@@ -27,8 +29,8 @@ from qs.backtester.stats import (
 from qs.strategy.ah_premium_quarterly import AHPremiumQuarterlyStrategy
 
 
-def load_calendar(start_date: str, db_path: str = "data/data.duckdb"):
-    con = duckdb.connect(db_path, read_only=True)
+def load_calendar(start_date: str, db_path: str = "data/data.sqlite"):
+    con = connect_sqlite(db_path, read_only=True)
     # Use union of A and H trading days to approximate combined calendar
     q = f"""
     SELECT trade_date,

@@ -8,11 +8,11 @@ from __future__ import annotations
     - 使用 H 股收盘价 (HKD) 并通过 USD/CNH 与 USD/HKD 两条汇率链折算为 RMB
     - 溢价 = A 股收盘价 / (H 股收盘价 * HKD→CNY) - 1
   数据来源:
-    - 源行情库: data/data.duckdb  (表: daily_a, daily_h, fx_daily)
+    - 源行情库: data/data.sqlite  (表: daily_a, daily_h, fx_daily)
     - 对照映射: data/ah_codes.csv (列: name, cn_code, hk_code)
     - 汇率: fx_daily 中 ts_code IN ('USDCNH.FXCM','USDHKD.FXCM') 取 (bid_close+ask_close)/2 作为当日美元中间价
   输出:
-    - 目标库: data/data_processed.duckdb
+    - 目标库: data/data_processed.sqlite
     - 表: ah_premium (全量重建, 可用 --append 选择增量追加未来日期)
 
 表结构 (字段含义):
@@ -47,11 +47,13 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-import duckdb  # type: ignore
+import pandas as pd
+
+from qs.sqlite_utils import connect_sqlite, table_exists
 
 # 默认路径
-SRC_DB_PATH = Path("data/data.duckdb")
-OUT_DB_PATH = Path("data/data_processed.duckdb")
+SRC_DB_PATH = Path("data/data.sqlite")
+OUT_DB_PATH = Path("data/data_processed.sqlite")
 AH_CODES_CSV = Path("data/ah_codes.csv")
 
 USDCNH_CODE = "USDCNH.FXCM"
@@ -71,26 +73,23 @@ def build_sql(existing_max_date: Optional[str] = None) -> str:
         # 只处理大于已存在最大日期的新日期
         date_filter = f"WHERE a.trade_date > '{existing_max_date}'"
     return f"""
-WITH mapping AS (
-  SELECT * FROM read_csv_auto('{AH_CODES_CSV.as_posix()}')
-),
 -- A 股收盘
 A AS (
-  SELECT ts_code, trade_date, close FROM daily_a
+  SELECT ts_code, trade_date, close FROM src.daily_a
 ),
 -- H 股收盘
 H AS (
-  SELECT ts_code, trade_date, close FROM daily_h
+  SELECT ts_code, trade_date, close FROM src.daily_h
 ),
 -- USD/CNH 中间价
 R_CNH AS (
   SELECT trade_date, (bid_close + ask_close)/2.0 AS usd_cnh_mid
-  FROM fx_daily WHERE ts_code = '{USDCNH_CODE}'
+  FROM src.fx_daily WHERE ts_code = '{USDCNH_CODE}'
 ),
 -- USD/HKD 中间价
 R_HKD AS (
   SELECT trade_date, (bid_close + ask_close)/2.0 AS usd_hkd_mid
-  FROM fx_daily WHERE ts_code = '{USDHKD_CODE}'
+  FROM src.fx_daily WHERE ts_code = '{USDHKD_CODE}'
 ),
 JOINED AS (
   SELECT
@@ -118,13 +117,26 @@ ORDER BY trade_date, cn_code
 """
 
 
-def ensure_source_objects(con: duckdb.DuckDBPyConnection) -> None:
+def _load_mapping_df(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "hk_code" not in df.columns and "c" in df.columns:
+        df = df.rename(columns={"c": "hk_code"})
+    required = {"name", "cn_code", "hk_code"}
+    missing_cols = required - set(df.columns)
+    if missing_cols:
+        raise RuntimeError(f"映射 CSV 缺少列: {sorted(missing_cols)} (path={path})")
+    return df[["name", "cn_code", "hk_code"]].copy()
+
+
+def ensure_source_objects(con) -> None:
     required = ["daily_a", "daily_h", "fx_daily"]
     missing: list[str] = []
     for t in required:
-        try:
-            con.execute(f"SELECT 1 FROM src.main.{t} LIMIT 1")
-        except Exception:
+        row = con.execute(
+            "SELECT 1 FROM src.sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            [t],
+        ).fetchone()
+        if row is None:
             missing.append(t)
     if missing:
         raise RuntimeError(
@@ -135,19 +147,12 @@ def ensure_source_objects(con: duckdb.DuckDBPyConnection) -> None:
 def rebuild(output_db: Path, source_db: Path) -> None:
     logger.info("全量重建 ah_premium (源=%s 输出=%s)", source_db, output_db)
     output_db.parent.mkdir(parents=True, exist_ok=True)
-    with duckdb.connect(str(output_db)) as out_con:
-        out_con.execute(f"ATTACH DATABASE '{source_db.as_posix()}' AS src (READ_ONLY)")
+    with connect_sqlite(output_db) as out_con:
+        src_path = source_db.as_posix().replace("'", "''")
+        out_con.execute(f"ATTACH DATABASE '{src_path}' AS src")
         ensure_source_objects(out_con)
-        # 创建引用视图 (引用附加库 main schema 中的表)
-        out_con.execute(
-            "CREATE OR REPLACE VIEW daily_a AS SELECT * FROM src.main.daily_a"
-        )
-        out_con.execute(
-            "CREATE OR REPLACE VIEW daily_h AS SELECT * FROM src.main.daily_h"
-        )
-        out_con.execute(
-            "CREATE OR REPLACE VIEW fx_daily AS SELECT * FROM src.main.fx_daily"
-        )
+        mapping_df = _load_mapping_df(AH_CODES_CSV)
+        mapping_df.to_sql("mapping", out_con, if_exists="replace", index=False)
         sql = build_sql()
         out_con.execute("DROP TABLE IF EXISTS ah_premium")
         logger.info("执行计算 SQL ...")
@@ -156,6 +161,7 @@ def rebuild(output_db: Path, source_db: Path) -> None:
             "CREATE UNIQUE INDEX IF NOT EXISTS ah_premium_uq ON ah_premium(cn_code, trade_date)"
         )
         cnt = out_con.execute("SELECT COUNT(*) FROM ah_premium").fetchone()[0]
+        out_con.execute("DROP TABLE IF EXISTS mapping")
         logger.info("完成: 写入 %d 行", cnt)
 
 
@@ -165,21 +171,13 @@ def append_new(output_db: Path, source_db: Path) -> None:
         rebuild(output_db, source_db)
         return
     logger.info("追加模式: 仅计算新日期 (源=%s 输出=%s)", source_db, output_db)
-    with duckdb.connect(str(output_db)) as out_con:
-        out_con.execute(f"ATTACH DATABASE '{source_db.as_posix()}' AS src (READ_ONLY)")
+    with connect_sqlite(output_db) as out_con:
+        src_path = source_db.as_posix().replace("'", "''")
+        out_con.execute(f"ATTACH DATABASE '{src_path}' AS src")
         ensure_source_objects(out_con)
-        out_con.execute(
-            "CREATE OR REPLACE VIEW daily_a AS SELECT * FROM src.main.daily_a"
-        )
-        out_con.execute(
-            "CREATE OR REPLACE VIEW daily_h AS SELECT * FROM src.main.daily_h"
-        )
-        out_con.execute(
-            "CREATE OR REPLACE VIEW fx_daily AS SELECT * FROM src.main.fx_daily"
-        )
-        if "ah_premium" not in {
-            r[0] for r in out_con.execute("SHOW TABLES").fetchall()
-        }:
+        mapping_df = _load_mapping_df(AH_CODES_CSV)
+        mapping_df.to_sql("mapping", out_con, if_exists="replace", index=False)
+        if not table_exists(out_con, "ah_premium"):
             logger.info("目标表不存在, 切换为全量重建")
             rebuild(output_db, source_db)
             return
@@ -192,7 +190,8 @@ def append_new(output_db: Path, source_db: Path) -> None:
             return
         sql = build_sql(existing_max_date=max_date)
         logger.info("新日期计算 SQL ... ( > %s )", max_date)
-        out_con.execute("CREATE OR REPLACE TEMP VIEW new_rows AS " + sql)
+        out_con.execute("DROP VIEW IF EXISTS new_rows")
+        out_con.execute("CREATE TEMP VIEW new_rows AS " + sql)
         new_cnt = out_con.execute("SELECT COUNT(*) FROM new_rows").fetchone()[0]
         if new_cnt == 0:
             logger.info("无新增日期, 结束")
@@ -201,6 +200,7 @@ def append_new(output_db: Path, source_db: Path) -> None:
         out_con.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ah_premium_uq ON ah_premium(cn_code, trade_date)"
         )
+        out_con.execute("DROP TABLE IF EXISTS mapping")
         logger.info("追加完成: 新增 %d 行", new_cnt)
 
 
@@ -209,10 +209,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--source-db",
         default=str(SRC_DB_PATH),
-        help="源行情 DuckDB 路径 (含 daily_a/daily_h/fx_daily)",
+        help="源行情 SQLite 路径 (含 daily_a/daily_h/fx_daily)",
     )
     p.add_argument(
-        "--output-db", default=str(OUT_DB_PATH), help="输出处理后 DuckDB 路径"
+        "--output-db", default=str(OUT_DB_PATH), help="输出处理后 SQLite 路径"
     )
     p.add_argument("--ah-csv", default=str(AH_CODES_CSV), help="A/H 映射 CSV 路径")
     mode = p.add_mutually_exclusive_group()

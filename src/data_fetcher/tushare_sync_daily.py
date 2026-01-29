@@ -1,7 +1,7 @@
 """
 文件: tushare_sync_daily.py
 功能:
-  增量同步多张日频数据表到 DuckDB (逐表独立增量, 不互相影响):
+  增量同步多张日频数据表到 SQLite (逐表独立增量, 不互相影响):
     - daily_a        (A 股日线)
     - adj_factor_a   (A 股复权因子)
     - bak_daily_a    (A 股特色扩展行情)
@@ -21,21 +21,21 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Iterable, Optional
 
-import duckdb  # type: ignore
 import pandas as pd  # type: ignore
 import tushare as ts  # type: ignore
 
-from data_fetcher.settings import settings  # noqa: E402
+from data_fetcher.settings import get_start_date, get_tushare_token  # noqa: E402
+from qs.sqlite_utils import connect_sqlite, ensure_unique_index, insert_df_ignore, table_exists
 
 # ───────────────────────────────────────────── 配置常量 ──
-TS_TOKEN: str = settings.tushare_api_token.get_secret_value()
-START_DATE: str = getattr(settings, "start_date", "20120101")
-DUCKDB_PATH = Path("data/data.duckdb")
+START_DATE: str = get_start_date("20120101")
+SQLITE_PATH = Path("data/data.sqlite")
 # 全局默认 (可被每个表在 TABLE_CONFIG 中以 limit / sleep / sleep_on_fail 覆盖)
 DEFAULT_LIMIT = 3000
 DEFAULT_SLEEP = 0.01
@@ -191,12 +191,11 @@ if not logging.getLogger().handlers:
     )
 logger = logging.getLogger(__name__)
 
-# ───────────────────────────────────────────── DuckDB 工具 ──
+# ───────────────────────────────────────────── SQLite 工具 ──
 
 
-def _connect() -> duckdb.DuckDBPyConnection:
-    DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(DUCKDB_PATH))
+def _connect() -> sqlite3.Connection:
+    con = connect_sqlite(SQLITE_PATH)
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS sync_date (
@@ -210,12 +209,12 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def _table_exists(con: duckdb.DuckDBPyConnection, table: str) -> bool:
-    return table in {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    return table_exists(con, table)
 
 
 def _get_latest_date(
-    con: duckdb.DuckDBPyConnection, table: str, ts_code: str
+    con: sqlite3.Connection, table: str, ts_code: str
 ) -> Optional[str]:
     if not _table_exists(con, table):
         return None
@@ -226,7 +225,7 @@ def _get_latest_date(
 
 
 def _get_last_sync(
-    con: duckdb.DuckDBPyConnection, table: str, ts_code: str
+    con: sqlite3.Connection, table: str, ts_code: str
 ) -> Optional[str]:
     row = con.execute(
         "SELECT last_update_date FROM sync_date WHERE table_name=? AND ts_code=?",
@@ -236,7 +235,7 @@ def _get_last_sync(
 
 
 def _set_last_sync(
-    con: duckdb.DuckDBPyConnection, table: str, ts_code: str, date_str: str
+    con: sqlite3.Connection, table: str, ts_code: str, date_str: str
 ) -> None:
     con.execute(
         """
@@ -250,7 +249,7 @@ def _set_last_sync(
 
 
 def _upsert(
-    con: duckdb.DuckDBPyConnection,
+    con: sqlite3.Connection,
     df: pd.DataFrame,
     table: str,
     context_ts: str | None = None,
@@ -266,19 +265,39 @@ def _upsert(
         return
     tag = f"{context_ts or ''} {context_name or ''}".strip()
     if not _table_exists(con, table):
-        con.register("df_view", df)
-        con.execute(f"CREATE TABLE {table} AS SELECT * FROM df_view")
-        con.execute(f"CREATE UNIQUE INDEX {table}_uq ON {table}(ts_code, trade_date)")
-        logger.info("[新建] %-14s %-22s 写入 %6d 行", table, tag, len(df))
-    else:
-        con.execute(
-            f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_uq ON {table}(ts_code, trade_date)"
+        df.head(0).to_sql(table, con, if_exists="fail", index=False)
+        if "ts_code" in df.columns and "trade_date" in df.columns:
+            ensure_unique_index(
+                con,
+                table=table,
+                columns=["ts_code", "trade_date"],
+                index_name=f"{table}_uq",
+            )
+        inserted = insert_df_ignore(
+            con,
+            df=df,
+            table=table,
+            unique_by=["ts_code", "trade_date"]
+            if "ts_code" in df.columns and "trade_date" in df.columns
+            else None,
         )
-        con.register("new_rows", df)
-        before = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        con.execute(f"INSERT OR IGNORE INTO {table} SELECT * FROM new_rows")
-        after = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        inserted = after - before
+        logger.info("[新建] %-14s %-22s 写入 %6d 行", table, tag, inserted)
+    else:
+        if "ts_code" in df.columns and "trade_date" in df.columns:
+            ensure_unique_index(
+                con,
+                table=table,
+                columns=["ts_code", "trade_date"],
+                index_name=f"{table}_uq",
+            )
+        inserted = insert_df_ignore(
+            con,
+            df=df,
+            table=table,
+            unique_by=["ts_code", "trade_date"]
+            if "ts_code" in df.columns and "trade_date" in df.columns
+            else None,
+        )
         logger.info(
             "[追加] %-14s %-22s 新增 %6d 行 (请求 %d)",
             table,
@@ -412,7 +431,7 @@ def _iter_tables(selected: Optional[Iterable[str]]) -> Iterable[str]:
 
 def _sync_one_table(
     pro: ts.pro_api,
-    con: duckdb.DuckDBPyConnection,
+    con: sqlite3.Connection,
     table_key: str,
     today: str,
 ) -> None:
@@ -507,7 +526,7 @@ def _sync_one_table(
 
 
 def sync(tables: Optional[Iterable[str]] = None) -> None:
-    pro = ts.pro_api(TS_TOKEN)
+    pro = ts.pro_api(get_tushare_token())
     today = datetime.now().strftime("%Y%m%d")
     with _connect() as con:
         for table_key in _iter_tables(tables):

@@ -1,3 +1,5 @@
+import _bootstrap  # noqa: F401
+
 from data_fetcher.tushare_sync_basic import data_sync as basic_sync
 from data_fetcher.tushare_sync_daily import sync as daily_sync
 from data_fetcher.vacuum import db_vacuum
