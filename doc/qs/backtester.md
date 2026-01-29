@@ -52,6 +52,7 @@
   - `price_map`: `{symbol: open_price}` 当前再平衡基准价 (建议用开盘价 / 下单执行价基准)。
   - `target_weights`: `{symbol: weight}` 目标权重 (0-1 之间, 未出现的 symbol 视为 0 → 若持仓会被清仓)。
   - 执行逻辑: 先卖出(含清仓) → 再买入, 降低资金占用冲突; size 向下取整, 允许残余现金。
+  - 估值基准: 会用 `price_map` 覆盖更新对应标的的当期估值价, 使目标仓位计算基于“当前 bar 参考价”(通常为开盘价)。
 
 示例:
 ```python
@@ -121,11 +122,6 @@ if is_quarter_first_day(trade_date):
 策略只读 feed，不直接修改。
 
 ## 5. Engine / 事件循环
-初始化:
-1. `feed.reset()`
-2. 取首 Bar，调用一次 `mark_prices` (若有) 进行初始权益记录。
-3. 记录第一点 `EquityPoint(trade_date, equity)`。
-
 主循环 (直至 `feed.step()` 返回 False):
 1. `bar = feed.current`
 2. `strategy.on_bar(bar, feed, broker)` —— 可产生交易 (执行价基于当日开盘价 + 滑点)。
@@ -140,9 +136,9 @@ if is_quarter_first_day(trade_date):
 --------|----------------
 年化收益率 | `compute_annual_returns(equity_curve)`
 最大回撤 | `compute_max_drawdown(equity_curve)`
-波动率 | `compute_risk_metrics(equity_curve, risk_free_rate=0.03)['volatility']`
-夏普比率 | `compute_risk_metrics(equity_curve, risk_free_rate=0.03)['sharpe']`
-胜率 | `compute_win_rate(trade_records)`
+波动率 | `compute_risk_metrics(equity_curve, initial_equity)['AnnVol']`
+夏普比率 | `compute_risk_metrics(equity_curve, initial_equity)['Sharpe']`
+胜率 | `compute_risk_metrics(equity_curve, initial_equity)['WinRate']`
 
 ## 7. 扩展建议
 - 增加分笔撮合 (成交量滑点模型)。

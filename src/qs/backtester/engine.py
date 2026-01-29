@@ -42,14 +42,7 @@ class BacktestEngine:
 
     def run(self):
         self.feed.reset()
-        first = self.feed.current
-        # initial mark with open price
-        self.broker.update_marks(
-            self._collect_marks(first) or {self.broker.symbol: first.open}
-        )
-        self.equity_curve.append(
-            EquityPoint(first.trade_date, self.broker.total_equity())
-        )
+        self.equity_curve = []
         while True:
             bar = self.feed.current
             self.strategy.on_bar(bar, self.feed, self.broker)

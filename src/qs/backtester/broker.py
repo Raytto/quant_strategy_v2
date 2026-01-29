@@ -270,8 +270,8 @@ class Broker:
         self, trade_date: str, symbol: str, price: float, target: float
     ):
         target = max(0.0, min(1.0, target))
-        # Use current marks for other symbols
-        self.last_prices.setdefault(symbol, price)
+        # Ensure the current symbol is marked at the executable reference price (typically today's open)
+        self.last_prices[symbol] = price
         equity = self.total_equity()
         exec_price = self._slippage_model.adjust_price(
             price, "BUY" if target > 0 else "SELL"
@@ -311,10 +311,10 @@ class Broker:
             clean_weights[sym] = min(1.0, max(0.0, w))
         # union of symbols
         symbols = set(self.positions.keys()) | set(clean_weights.keys())
-        # Stash open prices -> provide fallback for equity on new symbols
+        # Mark provided prices (typically today's open) so equity/targets are based on current valuations
         for sym, p in price_map.items():
             if p > 0:
-                self.last_prices.setdefault(sym, p)
+                self.last_prices[sym] = p
         equity = self.total_equity()
         # Build target sizes
         sells: List[tuple[str, int, float]] = []  # (sym, delta_size, raw_price)
