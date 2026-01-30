@@ -1,25 +1,30 @@
 # 回测框架 (`qs.backtester`) 使用说明 / 设计指南
 
-> 更新: 新增 `Broker.rebalance_target_percents` 及多标的 `order_target_percent_sym` 等接口, 使仓位调仓方式更贴近 backtrader 风格 (batch rebalance + target percent)。
+> 更新(基于当前真实代码): 在 `Broker` 支持多标的持仓 + 权重再平衡；在 `BacktestEngine` 增加 `on_start/on_end` 生命周期钩子以便复用资源(如 SQLite 连接)；提供统一 CLI runner 支持单标 / A+H 日历驱动回测。
 
 ## 1. 组件概览
-面向: 供大模型 / 开发者阅读以快速理解 `src/qs/backtester` 组件协同方式，并据此在 `src/qs/strategy` 新增策略、在 `scripts/` 下快速写测试脚本。
+面向: 供大模型 / 开发者阅读以快速理解 `src/qs/backtester` 组件协同方式，并据此在 `src/qs/strategy` 新增策略、用统一 runner 运行策略并对比结果。
 
 当前框架核心特征:
 - 轻量、无事件撮合/撮合簿，基于顺序日线 Bar 循环。
 - 支持多标的持仓 (Broker `positions` dict)；仍兼容单标的旧 API (`broker.buy()` 等)。
-- 策略可提供 `mark_prices` 钩子为多个资产估值；否则默认仅对默认 symbol 以当日 `bar.close` 估值。
+- 策略可提供 `mark_prices` 钩子为多个资产估值；单标策略默认对 `broker.symbol` 以当日 `bar.close` 估值。
+- 引擎支持策略生命周期 `on_start/on_end`，便于复用连接/缓存(例如 A/H 策略复用同一个 SQLite 连接避免每根 bar 重连)。
+- `mark_prices` 异常与“有持仓但 marks 为空”的情况可配置处理策略 (`warn/raise/ignore`)。
 - 交易成本模型: 简化佣金 + 卖出印花税 + 固定最小佣金；固定百分比滑点。
 - 结果: 逐 Bar 记录权益曲线；可通过 `qs.backtester.stats` 计算年化、最大回撤、波动率、夏普、胜率等。
 
 目录组件速览:
 | 模块 | 作用 | 关键类 / 函数 |
 |------|------|--------------|
+| `__init__.py` | 便捷导出(统一 import 入口) | `from qs.backtester import Broker, BacktestEngine, ...` |
 | `data.py` | 提供顺序遍历的 Bar 序列 | `Bar`, `DataFeed` |
 | `broker.py` | 资金、持仓、成交记录、费用计算 | `Broker`, `Position`, `TradeRecord` |
-| `engine.py` | 驱动回测循环，调用策略 & 更新估值 | `BacktestEngine`, `Strategy`(Protocol), `EquityPoint` |
+| `engine.py` | 驱动回测循环，调用策略 & 更新估值 | `BacktestEngine`, `EquityPoint` |
 | `stats.py` | 统计指标 | `compute_annual_returns`, `compute_max_drawdown`, `compute_risk_metrics` |
-| `strategy/` | 用户策略实现 | 示例: `simple_strategy_2.py` |
+| `runner.py` | 通用 runner / 导出 CSV | `run_backtest`, `load_bars_from_sqlite`, `load_calendar_bars_from_sqlite` |
+| `cli.py` | runner 的 CLI | `python scripts/backtest.py ...` |
+| `src/qs/strategy/` | 用户策略目录(建议：一文件一策略) | 示例: `simple_strategy_2.py`, `ah_premium_quarterly.py` |
 
 ---
 ## 2. Broker / 交易执行层
@@ -82,6 +87,9 @@ broker.rebalance_target_percents(trade_date, price_map, weights)
 - 可选 `mark_prices(bar, feed, broker) -> Mapping[symbol, price]`:
   - 返回本 Bar 用于估值的价格字典 (例如 A/H 收盘价、或多资产不同来源的同步价)。
   - 若未提供或返回空，Engine 回退到默认 symbol 的 `bar.close`。
+- 可选生命周期钩子:
+  - `on_start(feed, broker)`：回测开始时调用，适合打开数据库连接、预热缓存、加载静态数据等。
+  - `on_end(feed, broker)`：回测结束时调用，适合关闭连接、flush 输出等。
 
 设计约定:
 - `on_bar` 不直接修改 `feed` 内部索引。
@@ -89,7 +97,7 @@ broker.rebalance_target_percents(trade_date, price_map, weights)
 - 若需要互斥持仓，先平另一侧再买入 (参见 `SimpleStrategy2`)。
 
 ### 3.3 A/H 溢价策略示例 (季度再平衡)
-新策略需求: 每季度第一个交易日, 计算最近一个交易日 A/H 溢价 (来自 `ah_premium` 或现场计算), 选取溢价最高的 H 股若干支 + 溢价最低的 A 股若干支, 组合各占 50% 权重, 平均分配。
+新策略需求: 每季度第一个交易日, 基于原始行情库 `data/data.sqlite` 现场计算“最近一个交易日”的 A/H 溢价, 选取溢价最高的 H 股若干支 + 溢价最低的 A 股若干支, 组合各占 50% 权重, 平均分配。
 
 伪代码:
 ```python
@@ -123,11 +131,16 @@ if is_quarter_first_day(trade_date):
 
 ## 5. Engine / 事件循环
 主循环 (直至 `feed.step()` 返回 False):
+0. 若策略实现 `on_start`，先调用 `strategy.on_start(feed, broker)`。
 1. `bar = feed.current`
 2. `strategy.on_bar(bar, feed, broker)` —— 可产生交易 (执行价基于当日开盘价 + 滑点)。
 3. 收集 `mark_prices` (若提供)；否则默认当前 symbol `bar.close`。
 4. `broker.update_marks(marks)`；计算并追加权益点。
 5. 推进 feed。
+6. 回测结束后，若策略实现 `on_end`，调用 `strategy.on_end(feed, broker)`。
+
+多标的估值注意:
+- 如果 `broker.symbol == ""` (多标模式) 且存在持仓，但 `mark_prices` 为空/未实现，默认会提示(可通过 `BacktestEngine(mark_error_policy=...)` 控制为 `warn/raise/ignore`)。
 
 权益曲线: `engine.run()` 返回 `List[EquityPoint]`。
 
@@ -166,11 +179,45 @@ curve = engine.run()
 print('Final Equity', curve[-1].equity)
 ```
 
+### 8.2 通用 CLI Runner (推荐)
+当策略是“一个文件一个类/构造器”时，推荐直接使用通用 runner：
+```bash
+python scripts/backtest.py \
+  --strategy qs.strategy.simple_strategy:SimpleStrategy \
+  --strategy-kwargs '{"ts_code":"601628.SH"}' \
+  --feed single \
+  --symbol 601628.SH \
+  --table daily_a \
+  --start 20200101 \
+  --cash 1000000
+```
+输出会落在 `data/backtests/` 下（权益曲线 + 交易明细 CSV）。
+常用参数:
+- `--end`：结束日期（可选）
+- `--out-dir`：输出目录（默认 `data/backtests`）
+- `--tag`：输出文件名 tag（便于多策略对比）
+- `--log-trades`：打印交易日志（debug 用）
+- `--mark-error-policy {warn,raise,ignore}`：控制 `mark_prices` 异常/空 marks 的处理方式
+
+#### A/H 溢价策略 (calendar feed)
+`AHPremiumQuarterlyStrategy` 是多标的组合策略，runner 需要用 A/H 合并交易日历驱动（不需要 `--symbol`）。
+```bash
+python scripts/backtest.py \
+  --feed calendar_ah \
+  --strategy qs.strategy.ah_premium_quarterly:AHPremiumQuarterlyStrategy \
+  --strategy-kwargs '{"top_k":5,"bottom_k":5,"start_date":"20180101","capital_split":0.5,"db_path_raw":"data/data.sqlite"}' \
+  --start 20180101 \
+  --cash 1000000 \
+  --tag ah_premium_q
+```
+提示:
+- `--feed calendar_ah` 生成的是“交易日历 Bar”（OHLC 只是占位聚合），策略主要使用 `bar.trade_date` 驱动逻辑，并自行从数据库批量取 open/close/fx 做交易与估值。
+
 ---
 ## 9. LLM 生成代码提示
 - 始终先检查 `feed.prev is None` 以避免首 Bar 使用未来数据。
 - 若需要全仓操作优先用 `buy_all_sym` / `sell_all_sym` 简化 sizing。
-- 生成多标策略时记得实现 `mark_prices` 以保证权益准确。
+- 生成多标策略时记得实现 `mark_prices` 以保证权益准确；若需要频繁查库，优先用 `on_start/on_end` 复用连接。
 - 复用统计函数时需传原始初始资金以便计算 CAGR / Sharpe。
 
 ---

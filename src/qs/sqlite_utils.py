@@ -42,6 +42,55 @@ def ensure_unique_index(
     con.execute(f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" ON "{table}"({cols})')
 
 
+def dedupe_table(
+    con: sqlite3.Connection,
+    *,
+    table: str,
+    key_columns: Sequence[str],
+    delete_null_keys: bool = False,
+) -> int:
+    """Delete duplicate rows by key, keeping the smallest rowid for each key."""
+    if not key_columns:
+        return 0
+
+    before = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+
+    if delete_null_keys:
+        where = " OR ".join([f'"{c}" IS NULL OR "{c}" = \'\'' for c in key_columns])
+        con.execute(f'DELETE FROM "{table}" WHERE {where}')
+
+    cols = ", ".join([f'"{c}"' for c in key_columns])
+    con.execute(
+        f"""
+        DELETE FROM "{table}"
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid) FROM "{table}" GROUP BY {cols}
+        )
+        """
+    )
+    after = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+    return int(before - after)
+
+
+def ensure_unique_index_with_dedupe(
+    con: sqlite3.Connection,
+    *,
+    table: str,
+    columns: Sequence[str],
+    index_name: str,
+    delete_null_keys: bool = False,
+) -> None:
+    """Ensure a UNIQUE index exists; if creation fails, dedupe then retry."""
+    if delete_null_keys and columns:
+        where = " OR ".join([f'"{c}" IS NULL OR "{c}" = \'\'' for c in columns])
+        con.execute(f'DELETE FROM "{table}" WHERE {where}')
+    try:
+        ensure_unique_index(con, table=table, columns=columns, index_name=index_name)
+    except sqlite3.IntegrityError:
+        dedupe_table(con, table=table, key_columns=columns, delete_null_keys=delete_null_keys)
+        ensure_unique_index(con, table=table, columns=columns, index_name=index_name)
+
+
 def read_sql_df(
     con: sqlite3.Connection, sql: str, params: Sequence[Any] | None = None
 ) -> "pd.DataFrame":
@@ -83,3 +132,14 @@ def insert_df_ignore(
     con.executemany(sql, records)
     after = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
     return int(after - before)
+
+
+__all__ = [
+    "connect_sqlite",
+    "table_exists",
+    "ensure_unique_index",
+    "dedupe_table",
+    "ensure_unique_index_with_dedupe",
+    "read_sql_df",
+    "insert_df_ignore",
+]

@@ -3,9 +3,9 @@ from __future__ import annotations
 """Quarterly (configurable) A/H premium mean-reversion allocation strategy.
 
 Idea:
-  - Universe: A/H dual-listed pairs defined in data/ah_codes.csv (already used in ah_premium processing)
+  - Universe: A/H dual-listed pairs defined in data/ah_codes.csv
   - For each quarter start trading day (first trading day whose month in {1,4,7,10} and previous bar month != current or prev date < start date),
-      * Look at latest available premium snapshot (table ah_premium in data_processed.sqlite) for previous trading day.
+      * Look at previous trading day's A/H premium snapshot computed from raw SQLite (data/data.sqlite).
       * Rank by premium_pct (A over H premium). Higher premium means A >> H relative (A expensive). We buy H (expect convergence) on high premium side.
       * Lowest premium (A cheap vs H) -> buy A.
       * Capital split: 50% allocated to top_k H-leg symbols equally; 50% to bottom_k A-leg symbols equally.
@@ -13,22 +13,19 @@ Idea:
   - Hold until next quarter rebalance.
 
 Simplifications:
-  - Use previous trading day's premium snapshot to avoid lookahead (assuming premium table built after close with same-day prices + FX of that day).
-  - Execution price uses current bar open price for selected side (A or H). We need those open prices available. Strategy relies on a price_loader callback to supply current open of each symbol.
+  - Use previous trading day's close + FX to avoid lookahead.
+  - Execution price uses current bar open price loaded from daily tables (A: daily_a, H: daily_h; H leg converted HKD->CNY).
   - Accepts parameters: top_k, bottom_k (default same k), start_date, min_price optional filters.
   - 货币换算: H 股价格以 HKD 报价, 回测资金以 CNY 计价。这里按 fx_daily 中 USD/CNH 与 USD/HKD 交叉得到 HKD→CNY 汇率, 对 H 股 open/close 做换算; 若当日缺失, 取最近不晚于 trade_date 的可用汇率。否则跳过再平衡以避免混合币种。
 
 Dependencies:
-  - SQLite file data/data_processed.sqlite (table ah_premium)
-  - Price provider capable of returning today's open for arbitrary symbol (A or H) for `price_map`.
+  - SQLite file data/data.sqlite (tables: daily_a, daily_h, fx_daily; optional: adj_factor_a, adj_factor_h)
   - fx_daily: ts_code IN ('USDCNH.FXCM','USDHKD.FXCM').
 
 Usage in script:
   feed = DataFeed(bars_for_calendar_only) # can be a simple index daily bars to iterate trading days
   broker = Broker(cash=1_000_000, enable_trade_log=False)
-  strat = AHPremiumQuarterlyStrategy(db_path_processed='data/data_processed.sqlite',
-                                     db_path_raw='data/data.sqlite',
-                                     top_k=5, bottom_k=5)
+  strat = AHPremiumQuarterlyStrategy(db_path_raw='data/data.sqlite', top_k=5, bottom_k=5)
   engine = BacktestEngine(feed, broker, strat)
   curve = engine.run()
 
@@ -36,13 +33,14 @@ Note: feed bars drive the calendar; actual traded symbols are updated via mark_p
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Sequence, Any
+from typing import List, Dict, Optional, Sequence, Any, Iterable
 import csv
 
 from ..sqlite_utils import connect_sqlite
 from ..backtester.data import Bar, DataFeed
 from ..backtester.broker import Broker
 import time
+import sqlite3
 
 
 @dataclass
@@ -68,7 +66,6 @@ def quarter_key(date_str: str) -> str:
 class AHPremiumQuarterlyStrategy:
     def __init__(
         self,
-        db_path_processed: str = "data/data_processed.sqlite",
         db_path_raw: str = "data/data.sqlite",
         top_k: int = 5,
         bottom_k: int = 5,
@@ -80,7 +77,6 @@ class AHPremiumQuarterlyStrategy:
         rebalance_month_interval: int = 3,
     ):
         t0 = time.perf_counter()
-        self.dbp = db_path_processed
         self.dbr = db_path_raw
         self.top_k = top_k
         self.bottom_k = bottom_k
@@ -97,46 +93,83 @@ class AHPremiumQuarterlyStrategy:
         self._latest_premium_date: Optional[str] = None
         self._open_cache: Dict[str, Dict[str, float]] = {}
         self._fx_cache: Dict[str, float] = {}
-        self._max_adj_a: Dict[str, float] = {}
-        self._max_adj_h: Dict[str, float] = {}
         # per-symbol last adj_factor 基准
         self._base_adj_a: Dict[str, float] = {}
         self._base_adj_h: Dict[str, float] = {}
+        self._pairs: list[tuple[str, str, str]] = list(self._load_pairs_csv("data/ah_codes.csv"))
         self.rebalance_history: List[Dict[str, Any]] = []
         if self.use_adjusted or self.premium_use_adjusted:
             con = connect_sqlite(self.dbr, read_only=True)
-            for row in con.execute(
-                "SELECT ts_code, MAX(adj_factor) FROM adj_factor_a GROUP BY ts_code"
-            ).fetchall():
-                self._max_adj_a[row[0]] = float(row[1])
-            for row in con.execute(
-                "SELECT ts_code, MAX(adj_factor) FROM adj_factor_h GROUP BY ts_code"
-            ).fetchall():
-                self._max_adj_h[row[0]] = float(row[1])
-            # 由每个 symbol 自身最后一个交易日的 adj_factor 作为 base
-            for row in con.execute(
-                """
-                SELECT a.ts_code, a.adj_factor
-                FROM adj_factor_a a
-                JOIN (SELECT ts_code, MAX(trade_date) AS last_date FROM adj_factor_a GROUP BY ts_code) t
-                  ON a.ts_code=t.ts_code AND a.trade_date=t.last_date
-                """
-            ).fetchall():
-                self._base_adj_a[row[0]] = float(row[1])
-            for row in con.execute(
-                """
-                SELECT h.ts_code, h.adj_factor
-                FROM adj_factor_h h
-                JOIN (SELECT ts_code, MAX(trade_date) AS last_date FROM adj_factor_h GROUP BY ts_code) t
-                  ON h.ts_code=t.ts_code AND h.trade_date=t.last_date
-                """
-            ).fetchall():
-                self._base_adj_h[row[0]] = float(row[1])
+            a_syms = sorted({cn for _, cn, _ in self._pairs})
+            h_syms = sorted({hk for _, _, hk in self._pairs})
+            self._base_adj_a = self._load_latest_adj_factors(con, "adj_factor_a", a_syms)
+            self._base_adj_h = self._load_latest_adj_factors(con, "adj_factor_h", h_syms)
             con.close()
         t1 = time.perf_counter()
         print(
             f"[AHPremiumQuarterlyStrategy] __init__ preload factors: {t1-t0:.3f}s (premium_use_adjusted={self.premium_use_adjusted}, interval={self.rebalance_month_interval}m, base=per-symbol-last)"
         )
+
+        self._con_raw: sqlite3.Connection | None = None
+
+    @staticmethod
+    def _load_pairs_csv(path: str) -> Iterable[tuple[str, str, str]]:
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                return []
+            if "hk_code" in reader.fieldnames:
+                hk_col = "hk_code"
+            elif "c" in reader.fieldnames:
+                hk_col = "c"
+            else:
+                raise RuntimeError("ah_codes.csv missing hk_code column (expected hk_code or c)")
+
+            pairs: list[tuple[str, str, str]] = []
+            for row in reader:
+                cn_code = (row.get("cn_code") or "").strip()
+                hk_code = (row.get(hk_col) or "").strip()
+                if not cn_code or not hk_code:
+                    continue
+                pairs.append(((row.get("name") or "").strip(), cn_code, hk_code))
+            return pairs
+
+    @staticmethod
+    def _load_latest_adj_factors(
+        con: sqlite3.Connection, table: str, symbols: Sequence[str]
+    ) -> Dict[str, float]:
+        if not symbols:
+            return {}
+        # If the table doesn't exist (e.g. user didn't sync adj_factor_*), fall back to raw prices.
+        row = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1", [table]
+        ).fetchone()
+        if row is None:
+            return {}
+        in_list = ",".join([repr(s) for s in symbols])
+        q = f"""
+        SELECT a.ts_code, a.adj_factor
+        FROM {table} a
+        JOIN (SELECT ts_code, MAX(trade_date) AS last_date FROM {table} GROUP BY ts_code) t
+          ON a.ts_code=t.ts_code AND a.trade_date=t.last_date
+        WHERE a.ts_code IN ({in_list})
+        """
+        return {ts: float(adj) for ts, adj in con.execute(q).fetchall() if adj is not None}
+
+    def _raw_con(self) -> sqlite3.Connection:
+        if self._con_raw is None:
+            self._con_raw = connect_sqlite(self.dbr, read_only=True)
+        return self._con_raw
+
+    def on_start(self, feed: DataFeed, broker: Broker) -> None:
+        self._raw_con()
+
+    def on_end(self, feed: DataFeed, broker: Broker) -> None:
+        if self._con_raw is not None:
+            try:
+                self._con_raw.close()
+            finally:
+                self._con_raw = None
 
     # 提供给 notebook: 全量再平衡历史
     def get_rebalance_history(self) -> List[Dict[str, Any]]:
@@ -146,7 +179,7 @@ class AHPremiumQuarterlyStrategy:
     def _load_hk_to_cny_rate(self, trade_date: str) -> Optional[float]:
         if trade_date in self._fx_cache:
             return self._fx_cache[trade_date]
-        con = connect_sqlite(self.dbr, read_only=True)
+        con = self._raw_con()
         # find latest date <= trade_date having both rates
         q = f"""
         WITH d AS (
@@ -164,7 +197,6 @@ class AHPremiumQuarterlyStrategy:
         GROUP BY d.trade_date
         """
         row = con.execute(q).fetchone()
-        con.close()
         if not row:
             return None
         _, usd_cnh, usd_hkd = row
@@ -177,53 +209,44 @@ class AHPremiumQuarterlyStrategy:
     # --- data helpers -------------------------------------------------
     def _load_premium_for_date(self, trade_date: str) -> List[PremiumRecord]:
         t0 = time.perf_counter()
-        mapping: list[tuple[str, str, str]] = []
-        with open("data/ah_codes.csv", newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                return []
-            if "hk_code" in reader.fieldnames:
-                hk_col = "hk_code"
-            elif "c" in reader.fieldnames:
-                hk_col = "c"
-            else:
-                raise RuntimeError(
-                    "ah_codes.csv missing hk_code column (expected hk_code or c)"
-                )
-            for row in reader:
-                cn_code = (row.get("cn_code") or "").strip()
-                hk_code = (row.get(hk_col) or "").strip()
-                if not cn_code or not hk_code:
-                    continue
-                mapping.append(((row.get("name") or "").strip(), cn_code, hk_code))
+        mapping = self._pairs
+        if not mapping:
+            return []
 
-        con = connect_sqlite(self.dbr, read_only=True)
+        con = self._raw_con()
         a_codes = [row[1] for row in mapping]
         h_codes = [row[2] for row in mapping]
+        in_a = ",".join([repr(x) for x in a_codes]) if a_codes else "''"
+        in_h = ",".join([repr(x) for x in h_codes]) if h_codes else "''"
+
+        # LEFT JOIN to avoid dropping prices when adj_factor is missing; treat missing adj_factor as 1.0.
         a_rows = con.execute(
-            f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_codes])})"
+            f"""
+            SELECT a.ts_code, a.close, COALESCE(af.adj_factor, 1.0) AS adj_factor
+            FROM daily_a a
+            LEFT JOIN adj_factor_a af USING(ts_code, trade_date)
+            WHERE a.trade_date='{trade_date}' AND a.ts_code IN ({in_a})
+            """
         ).fetchall()
         h_rows = con.execute(
-            f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_codes])})"
+            f"""
+            SELECT h.ts_code, h.close, COALESCE(af.adj_factor, 1.0) AS adj_factor
+            FROM daily_h h
+            LEFT JOIN adj_factor_h af USING(ts_code, trade_date)
+            WHERE h.trade_date='{trade_date}' AND h.ts_code IN ({in_h})
+            """
         ).fetchall()
-        a_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in a_rows}
-        h_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in h_rows}
-        fx_row = con.execute(
-            f"SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDCNH.FXCM' AND trade_date='{trade_date}'"
-        ).fetchone()
-        usd_cnh_mid = float(fx_row[0]) if fx_row and fx_row[0] is not None else None
-        fx_row = con.execute(
-            f"SELECT (bid_close+ask_close)/2 FROM fx_daily WHERE ts_code='USDHKD.FXCM' AND trade_date='{trade_date}'"
-        ).fetchone()
-        usd_hkd_mid = float(fx_row[0]) if fx_row and fx_row[0] is not None else None
-        con.close()
-        if usd_cnh_mid is None or usd_hkd_mid is None:
+        a_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in a_rows if r[1] is not None}
+        h_raw_map = {r[0]: (float(r[1]), float(r[2])) for r in h_rows if r[1] is not None}
+
+        hk_to_cny = self._load_hk_to_cny_rate(trade_date)
+        if hk_to_cny is None:
             t1 = time.perf_counter()
             print(
                 f"[AHPremiumQuarterlyStrategy] _load_premium_for_date({trade_date}) missing FX: {t1-t0:.3f}s"
             )
             return []
-        hk_to_cny = usd_cnh_mid / usd_hkd_mid if usd_hkd_mid else None
+
         recs: List[PremiumRecord] = []
         for name, cn_code, hk_code in mapping:
             if cn_code not in a_raw_map or hk_code not in h_raw_map:
@@ -231,20 +254,18 @@ class AHPremiumQuarterlyStrategy:
             close_a_raw, adj_a = a_raw_map[cn_code]
             close_h_raw_hkd, adj_h = h_raw_map[hk_code]
             # 原始价格(换算CNY后)
-            h_close_raw_cny = close_h_raw_hkd * hk_to_cny if hk_to_cny else None
+            h_close_raw_cny = close_h_raw_hkd * hk_to_cny
             if h_close_raw_cny is None or h_close_raw_cny == 0:
                 continue
-            # 复权（统一基准：latest date 的 adj_factor）
-            base_a = self._base_adj_a.get(cn_code) or self._max_adj_a.get(cn_code, 1.0)
-            base_h = self._base_adj_h.get(hk_code) or self._max_adj_h.get(hk_code, 1.0)
-            if not base_a:
+            # 复权（统一基准：per-symbol last adj_factor；缺失则 base=1）
+            base_a = self._base_adj_a.get(cn_code) or 1.0
+            base_h = self._base_adj_h.get(hk_code) or 1.0
+            if base_a == 0:
                 base_a = 1.0
-            if not base_h:
+            if base_h == 0:
                 base_h = 1.0
             a_close_adj = close_a_raw * adj_a / base_a
-            h_close_adj_cny = (
-                (close_h_raw_hkd * adj_h / base_h) * hk_to_cny if hk_to_cny else None
-            )
+            h_close_adj_cny = (close_h_raw_hkd * adj_h / base_h) * hk_to_cny
             if h_close_adj_cny is None or h_close_adj_cny == 0:
                 continue
             # 溢价：根据用户参数决定使用 raw 还是 adj
@@ -297,17 +318,22 @@ class AHPremiumQuarterlyStrategy:
             cache = self._open_cache[trade_date]
             if all(s in cache for s in symbols):
                 return {s: cache[s] for s in symbols}
-        con = connect_sqlite(self.dbr, read_only=True)
+        con = self._raw_con()
         res: Dict[str, float] = {}
         a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
         h_syms = [s for s in symbols if s.endswith(".HK")]
         if a_syms:
             rows = con.execute(
-                f"SELECT ts_code, open, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
+                f"""
+                SELECT a.ts_code, a.open, COALESCE(af.adj_factor, 1.0) AS adj_factor
+                FROM daily_a a
+                LEFT JOIN adj_factor_a af USING(ts_code, trade_date)
+                WHERE a.trade_date='{trade_date}' AND a.ts_code IN ({','.join([repr(x) for x in a_syms])})
+                """
             ).fetchall()
             for ts, open_, adj in rows:
                 if self.use_adjusted:
-                    base = self._base_adj_a.get(ts) or self._max_adj_a.get(ts, 1.0)
+                    base = self._base_adj_a.get(ts) or 1.0
                     if base == 0:
                         base = 1.0
                     res[ts] = float(open_) * float(adj) / base
@@ -315,11 +341,15 @@ class AHPremiumQuarterlyStrategy:
                     res[ts] = float(open_)
         if h_syms:
             rows = con.execute(
-                f"SELECT ts_code, open, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
+                f"""
+                SELECT h.ts_code, h.open, COALESCE(af.adj_factor, 1.0) AS adj_factor
+                FROM daily_h h
+                LEFT JOIN adj_factor_h af USING(ts_code, trade_date)
+                WHERE h.trade_date='{trade_date}' AND h.ts_code IN ({','.join([repr(x) for x in h_syms])})
+                """
             ).fetchall()
             rate = self._load_hk_to_cny_rate(trade_date)
             if rate is None:
-                con.close()
                 t1 = time.perf_counter()
                 print(
                     f"[AHPremiumQuarterlyStrategy] _load_opens({trade_date}) missing FX: {t1-t0:.3f}s"
@@ -327,14 +357,13 @@ class AHPremiumQuarterlyStrategy:
                 return {}
             for ts, open_, adj in rows:
                 if self.use_adjusted:
-                    base = self._base_adj_h.get(ts) or self._max_adj_h.get(ts, 1.0)
+                    base = self._base_adj_h.get(ts) or 1.0
                     if base == 0:
                         base = 1.0
                     local = float(open_) * float(adj) / base
                 else:
                     local = float(open_)
                 res[ts] = local * rate
-        con.close()
         self._open_cache.setdefault(trade_date, {}).update(res)
         t1 = time.perf_counter()
         print(
@@ -347,17 +376,22 @@ class AHPremiumQuarterlyStrategy:
         symbols = list(broker.positions.keys())
         if not symbols:
             return {}
-        con = connect_sqlite(self.dbr, read_only=True)
+        con = self._raw_con()
         res: Dict[str, float] = {}
         a_syms = [s for s in symbols if s.endswith(".SH") or s.endswith(".SZ")]
         h_syms = [s for s in symbols if s.endswith(".HK")]
         if a_syms:
             rows = con.execute(
-                f"SELECT ts_code, close, adj_factor FROM daily_a JOIN adj_factor_a USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in a_syms])})"
+                f"""
+                SELECT a.ts_code, a.close, COALESCE(af.adj_factor, 1.0) AS adj_factor
+                FROM daily_a a
+                LEFT JOIN adj_factor_a af USING(ts_code, trade_date)
+                WHERE a.trade_date='{bar.trade_date}' AND a.ts_code IN ({','.join([repr(x) for x in a_syms])})
+                """
             ).fetchall()
             for ts, close_, adj in rows:
                 if self.use_adjusted:
-                    base = self._base_adj_a.get(ts) or self._max_adj_a.get(ts, 1.0)
+                    base = self._base_adj_a.get(ts) or 1.0
                     if base == 0:
                         base = 1.0
                     res[ts] = float(close_) * float(adj) / base
@@ -365,22 +399,25 @@ class AHPremiumQuarterlyStrategy:
                     res[ts] = float(close_)
         if h_syms:
             rows = con.execute(
-                f"SELECT ts_code, close, adj_factor FROM daily_h JOIN adj_factor_h USING(ts_code,trade_date) WHERE trade_date='{bar.trade_date}' AND ts_code IN ({','.join([repr(x) for x in h_syms])})"
+                f"""
+                SELECT h.ts_code, h.close, COALESCE(af.adj_factor, 1.0) AS adj_factor
+                FROM daily_h h
+                LEFT JOIN adj_factor_h af USING(ts_code, trade_date)
+                WHERE h.trade_date='{bar.trade_date}' AND h.ts_code IN ({','.join([repr(x) for x in h_syms])})
+                """
             ).fetchall()
             rate = self._load_hk_to_cny_rate(bar.trade_date)
             if rate is None:
-                con.close()
-                return {}
+                return res
             for ts, close_, adj in rows:
                 if self.use_adjusted:
-                    base = self._base_adj_h.get(ts) or self._max_adj_h.get(ts, 1.0)
+                    base = self._base_adj_h.get(ts) or 1.0
                     if base == 0:
                         base = 1.0
                     local = float(close_) * float(adj) / base
                 else:
                     local = float(close_)
                 res[ts] = local * rate
-        con.close()
         return res
 
     # --- core event ----------------------------------------------------
@@ -389,7 +426,7 @@ class AHPremiumQuarterlyStrategy:
         # 先检查已持仓标的是否在今日之后退市(或今日即退市)，若退市则按 0 价值核销
         if broker.positions:
             try:
-                con = connect_sqlite(self.dbr, read_only=True)
+                con = self._raw_con()
                 # 查询 A / H 基础表的 delist_date
                 held_syms = list(broker.positions.keys())
                 # 拆分 A/H
@@ -404,7 +441,6 @@ class AHPremiumQuarterlyStrategy:
                 if h_syms:
                     q_h = f"SELECT ts_code, delist_date FROM stock_basic_h WHERE ts_code IN ({','.join([repr(x) for x in h_syms])})"
                     rows += con.execute(q_h).fetchall()
-                con.close()
                 for ts_code, delist_date in rows:
                     if (
                         delist_date

@@ -8,8 +8,7 @@ Steps:
  3. Run engine, compute stats.
 
 Assumptions:
-  - Databases: data/data.sqlite (raw), data/data_processed.sqlite (processed with ah_premium table).
-  - Ensure ah_premium table up-to-date covering test period (run its generator beforehand).
+  - Database: data/data.sqlite (raw, contains daily_a/daily_h/fx_daily and optionally adj_factor_a/adj_factor_h).
 
 CLI:
   python scripts/ah_premium_quarterly_bt.py --start 20180101 --top 5 --bottom 5 --cash 1000000
