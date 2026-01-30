@@ -34,6 +34,7 @@ Note: feed bars drive the calendar; actual traded symbols are updated via mark_p
 
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Sequence, Any, Iterable
+from pathlib import Path
 import csv
 
 from ..sqlite_utils import connect_sqlite
@@ -67,6 +68,7 @@ class AHPremiumQuarterlyStrategy:
     def __init__(
         self,
         db_path_raw: str = "data/data.sqlite",
+        pairs_csv_path: str | Path = "data/ah_codes.csv",
         top_k: int = 5,
         bottom_k: int = 5,
         start_date: str = "20180101",
@@ -96,7 +98,9 @@ class AHPremiumQuarterlyStrategy:
         # per-symbol last adj_factor 基准
         self._base_adj_a: Dict[str, float] = {}
         self._base_adj_h: Dict[str, float] = {}
-        self._pairs: list[tuple[str, str, str]] = list(self._load_pairs_csv("data/ah_codes.csv"))
+        self._pairs: list[tuple[str, str, str]] = list(
+            self._load_pairs_csv(self._resolve_data_path(pairs_csv_path))
+        )
         self.rebalance_history: List[Dict[str, Any]] = []
         if self.use_adjusted or self.premium_use_adjusted:
             con = connect_sqlite(self.dbr, read_only=True)
@@ -113,8 +117,20 @@ class AHPremiumQuarterlyStrategy:
         self._con_raw: sqlite3.Connection | None = None
 
     @staticmethod
-    def _load_pairs_csv(path: str) -> Iterable[tuple[str, str, str]]:
-        with open(path, newline="", encoding="utf-8") as f:
+    def _resolve_data_path(path: str | Path) -> Path:
+        p = Path(path)
+        if p.is_absolute():
+            return p
+        if p.exists():
+            return p
+        # Notebook cwd is typically `notebooks/`, so prefer repo-root-relative path.
+        repo_root = Path(__file__).resolve().parents[3]
+        return repo_root / p
+
+    @staticmethod
+    def _load_pairs_csv(path: str | Path) -> Iterable[tuple[str, str, str]]:
+        p = Path(path)
+        with p.open(newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if not reader.fieldnames:
                 return []

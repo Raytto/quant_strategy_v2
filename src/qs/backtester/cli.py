@@ -12,6 +12,7 @@ from .runner import (
     write_equity_curve_csv,
     write_trades_csv,
 )
+from .defaults import DEFAULT_INITIAL_CASH
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--symbol", default="", help="ts_code for single-symbol feeds")
     p.add_argument("--start", default="20200101")
     p.add_argument("--end", default="")
-    p.add_argument("--cash", type=float, default=1_000_000.0)
+    p.add_argument("--cash", type=float, default=DEFAULT_INITIAL_CASH)
     p.add_argument("--log-trades", action="store_true")
     p.add_argument(
         "--mark-error-policy",

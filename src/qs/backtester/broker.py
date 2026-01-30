@@ -2,6 +2,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 
+from .defaults import DEFAULT_INITIAL_CASH, DEFAULT_MIN_COMMISSION
+
 
 @dataclass
 class Position:
@@ -33,7 +35,7 @@ class TradeRecord:
 class CommissionInfo:
     commission_rate: float = 0.00015  # 0.015%
     tax_rate: float = 0.0005  # 0.05% (sell side)
-    min_commission: float = 5.0  # minimum per trade
+    min_commission: float = DEFAULT_MIN_COMMISSION  # minimum per trade
 
     def buy_fees(self, gross_amount: float) -> float:
         # 仅佣金
@@ -66,12 +68,12 @@ class Broker:
 
     def __init__(
         self,
-        cash: float,
+        cash: float = DEFAULT_INITIAL_CASH,
         enable_trade_log: bool = False,
         commission_rate: float = 0.00015,
         tax_rate: float = 0.0005,
         slippage: float = 0.0002,
-        min_commission: float = 5.0,
+        min_commission: float = DEFAULT_MIN_COMMISSION,
         symbol: str = "",
     ):
         self.cash = cash
@@ -248,8 +250,14 @@ class Broker:
     ):
         if size is None:
             exec_price = self._slippage_model.adjust_price(price, "BUY")
-            est_per_share = exec_price * (1 + self.commission_rate)
-            size = int(self.cash // est_per_share)
+            if exec_price <= 0:
+                return 0
+            if self.cash <= self.min_commission:
+                size = 0
+            else:
+                size_min_fee = int((self.cash - self.min_commission) // exec_price)
+                size_prop_fee = int(self.cash // (exec_price * (1 + self.commission_rate)))
+                size = max(0, min(size_min_fee, size_prop_fee))
         return self._execute_buy(trade_date, symbol, price, int(size))
 
     def sell_sym(

@@ -10,6 +10,7 @@ from qs.sqlite_utils import connect_sqlite
 
 from .broker import Broker
 from .data import Bar, DataFeed
+from .defaults import DEFAULT_INITIAL_CASH
 from .engine import BacktestEngine, Strategy
 from .stats import compute_annual_returns, compute_max_drawdown, compute_risk_metrics
 
@@ -101,7 +102,7 @@ def run_backtest(
     *,
     bars: list[Bar],
     strategy: Strategy,
-    initial_cash: float,
+    initial_cash: float = DEFAULT_INITIAL_CASH,
     symbol: str = "",
     enable_trade_log: bool = False,
     mark_error_policy: str = "warn",
