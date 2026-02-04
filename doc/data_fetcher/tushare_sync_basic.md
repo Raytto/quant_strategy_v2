@@ -1,14 +1,15 @@
-﻿# TuShare 基础数据同步（A/H/FX）`tushare_sync_basic.py`
+﻿# TuShare 基础数据同步（A/H/ETF/FX）`tushare_sync_basic.py`
 
 说明：本文件为 `doc/data/tushare_sync_basic.md` 的同内容副本，方便在 `doc/data_fetcher/` 目录下查阅。
 
 对应脚本：`src/data_fetcher/tushare_sync_basic.py`  
 目标数据库：`data/data.sqlite`
 
-该脚本用于全量刷新（覆盖写入）三张“代码池/资产维度”基础表，供后续日频增量同步脚本 `tushare_sync_daily.py` 使用：
+该脚本用于同步（增量插入、忽略已存在）四张“代码池/资产维度”基础表，供后续日频增量同步脚本 `tushare_sync_daily.py` 使用：
 - A 股基础：`stock_basic_a`（TuShare `stock_basic`）
 - 港股基础：`stock_basic_h`（TuShare `hk_basic`）
 - 外汇基础：`fx_basic`（TuShare `fx_obasic`，供 `fx_daily` 动态代码池使用）
+- ETF 基础：`etf_basic`（TuShare `etf_basic`）
 
 ---
 
@@ -55,20 +56,28 @@
 说明：
 - `traget_spread` 为接口原始字段名（可能存在拼写差异），脚本按文档字段名原样入库。
 
+### 1.4 `etf_basic`
+数据源：TuShare `etf_basic`  
+用途：ETF 代码池与基础元数据（基金经理、托管人、费率、跟踪指数等），可供后续 ETF 行情/持仓等同步脚本使用。
+
+字段（见 `MARKET_CONFIG['ETF']['fields']`）：
+- `ts_code, csname, extname, cname, index_code, index_name, setup_date, list_date, list_status, exchange, mgr_name, custod_name, mgt_fee, etf_type`
+
 ---
 
 ## 2. 核心逻辑（与脚本一致）
 
-1) 三个市场配置集中在 `MARKET_CONFIG`：包含 `api_name / params / fields / table`。  
+1) 四个市场配置集中在 `MARKET_CONFIG`：包含 `api_name / params / fields / table`。  
 2) `_fetch_table()` 分页拉取：
    - 每页 `limit=3000`（`LIMIT`），使用 `offset` 翻页；
    - 每页失败最多重试 `MAX_RETRY=3`，重试等待 `SLEEP*2`；
    - 正常翻页间隔 `SLEEP=0.6s`（约每分钟 100 次调用）。
 3) 拉取完成后会对 `ts_code` 做去重（防止分页重复/接口异常）。  
-4) `_upsert()` 的落库策略是“全量覆盖”：
-   - `to_sql(if_exists="replace")` 覆盖写入（保证名称/行业/上市状态等字段变更会更新）；
-   - 若存在 `ts_code` 列，会创建唯一索引（并在建索引前做去重兜底）：
-     - `stock_basic_a_uq` / `stock_basic_h_uq` / `fx_basic_uq`
+4) `_upsert()` 的落库策略是“增量插入（忽略重复）”：
+   - 首次运行会创建表结构（按本次拉取字段建表）；
+   - 若存在 `ts_code` 列，会创建唯一索引：
+     - `stock_basic_a_uq` / `stock_basic_h_uq` / `fx_basic_uq` / `etf_basic_uq`
+   - 后续运行使用 `INSERT OR IGNORE` 插入新行；已存在的 `ts_code` 不会被更新。
 5) 日志：脚本在未配置根 logger 时强制启用 `INFO` 级别，确保被 `import` 调用也可见进度日志。
 
 ---
@@ -104,7 +113,9 @@ SELECT 'A' AS mkt, COUNT(*) AS n FROM stock_basic_a
 UNION ALL
 SELECT 'H' AS mkt, COUNT(*) AS n FROM stock_basic_h
 UNION ALL
-SELECT 'FX' AS mkt, COUNT(*) AS n FROM fx_basic;
+SELECT 'FX' AS mkt, COUNT(*) AS n FROM fx_basic
+UNION ALL
+SELECT 'ETF' AS mkt, COUNT(*) AS n FROM etf_basic;
 ```
 
 检查主键重复（理论上应为 0 行）：

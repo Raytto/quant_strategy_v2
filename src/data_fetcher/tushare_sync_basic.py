@@ -1,6 +1,6 @@
 """
 文件: tushare_sync_basic.py
-功能: 可配置地同步 A / H 股（及 FX 外汇基础）列表至 SQLite，并在导入时保证 INFO 日志可见。
+功能: 可配置地同步 A / H 股、ETF（及 FX 外汇基础）列表至 SQLite，并在导入时保证 INFO 日志可见。
 新增: fx_basic (TuShare 接口 fx_obasic, doc_id=178) 动态外汇代码池供 fx_daily 使用。
 """
 
@@ -104,6 +104,34 @@ MARKET_CONFIG: Dict[str, Dict[str, Any]] = {
         ],
         "params": {"exchange": "", "classify": "", "ts_code": ""},
         "table": "fx_basic",
+    },
+    "ETF": {
+        "api_name": "etf_basic",
+        "fields": [
+            "ts_code",
+            "csname",
+            "extname",
+            "cname",
+            "index_code",
+            "index_name",
+            "setup_date",
+            "list_date",
+            "list_status",
+            "exchange",
+            "mgr_name",
+            "custod_name",
+            "mgt_fee",
+            "etf_type",
+        ],
+        "params": {
+            "ts_code": "",
+            "index_code": "",
+            "list_date": "",
+            "list_status": "",
+            "exchange": "",
+            "mgr": "",
+        },
+        "table": "etf_basic",
     },
 }
 

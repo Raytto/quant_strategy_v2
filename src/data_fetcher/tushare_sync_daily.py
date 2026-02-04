@@ -7,6 +7,9 @@
     - bak_daily_a    (A 股特色扩展行情)
     - daily_h        (港股日线)
     - adj_factor_h   (港股复权因子)
+    - etf_daily      (ETF 日线行情: fund_daily)
+    - adj_factor_etf (ETF 复权因子: fund_adj)
+    - index_daily_etf(ETF 对应指数日线: index_daily, 代码来源 etf_basic.index_code)
     - fx_daily       (外汇日线: 代码来源 fx_basic 全量，可 CLI 过滤)
     - index_daily    (国内指数日线: 目前仅 000300.SH 沪深300)
     - index_global   (国际/全球指数日线: 目前仅 HSI 恒生指数, IXIC 纳斯达克综合)
@@ -63,6 +66,56 @@ TABLE_CONFIG: Dict[str, Dict[str, Any]] = {
         ],
         "stock_table": "fx_basic",  # 取自基础表(由 tushare_sync_basic 写入)
         "limit": 3000,
+    },
+    "etf_daily": {  # ETF 日线行情 (代码池: etf_basic)
+        "api_name": "fund_daily",
+        "fields": [
+            "ts_code",
+            "trade_date",
+            "pre_close",
+            "open",
+            "high",
+            "low",
+            "close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ],
+        "stock_table": "etf_basic",
+        "name_column": "csname",
+        "limit": 6000,
+    },
+    "adj_factor_etf": {  # ETF 复权因子 (代码池: etf_basic)
+        "api_name": "fund_adj",
+        "fields": ["ts_code", "trade_date", "adj_factor", "discount_rate"],
+        "stock_table": "etf_basic",
+        "name_column": "csname",
+        "limit": 6000,
+        "write_mode": "upsert",
+        "update_columns": ["adj_factor", "discount_rate"],
+        # 新增字段回填：当表结构缺少这些列时，按“已有最早日期~today”回拉一次以补齐列
+        "backfill_if_missing_columns": ["discount_rate"],
+    },
+    "index_daily_etf": {  # ETF 对应指数日线 (代码池: etf_basic.index_code)
+        "api_name": "index_daily",
+        "fields": [
+            "ts_code",
+            "trade_date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "pre_close",
+            "change",
+            "pct_chg",
+            "vol",
+            "amount",
+        ],
+        "stock_table": "etf_basic",
+        "code_column": "index_code",
+        "name_column": "index_name",
+        "limit": 6000,
     },
     "index_daily": {  # 国内指数 (使用显式 ts_codes 列表)
         "api_name": "index_daily",
@@ -213,6 +266,33 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
     return table_exists(con, table)
 
 
+def _get_table_columns(con: sqlite3.Connection, table: str) -> List[str]:
+    rows = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+    return [r[1] for r in rows]  # (cid, name, type, notnull, dflt_value, pk)
+
+
+def _sqlite_type_for_series(s: "pd.Series") -> str:
+    if pd.api.types.is_bool_dtype(s):
+        return "INTEGER"
+    if pd.api.types.is_integer_dtype(s):
+        return "INTEGER"
+    if pd.api.types.is_float_dtype(s):
+        return "REAL"
+    return "TEXT"
+
+
+def _ensure_table_has_columns(con: sqlite3.Connection, table: str, df: pd.DataFrame) -> None:
+    if df.empty or not _table_exists(con, table):
+        return
+    existing = set(_get_table_columns(con, table))
+    for col in df.columns:
+        if col in existing:
+            continue
+        col_type = _sqlite_type_for_series(df[col])
+        con.execute(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {col_type}')
+        existing.add(col)
+
+
 def _get_latest_date(
     con: sqlite3.Connection, table: str, ts_code: str
 ) -> Optional[str]:
@@ -220,6 +300,17 @@ def _get_latest_date(
         return None
     row = con.execute(
         f"SELECT MAX(trade_date) FROM {table} WHERE ts_code=?", [ts_code]
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _get_earliest_date(
+    con: sqlite3.Connection, table: str, ts_code: str
+) -> Optional[str]:
+    if not _table_exists(con, table):
+        return None
+    row = con.execute(
+        f"SELECT MIN(trade_date) FROM {table} WHERE ts_code=?", [ts_code]
     ).fetchone()
     return row[0] if row else None
 
@@ -254,6 +345,9 @@ def _upsert(
     table: str,
     context_ts: str | None = None,
     context_name: str | None = None,
+    *,
+    write_mode: str = "ignore",
+    update_columns: Optional[List[str]] = None,
 ) -> None:
     """将单只股票(或若干)的增量数据写入.
     context_ts/context_name 仅用于日志增强, 不参与逻辑.
@@ -264,6 +358,37 @@ def _upsert(
         )
         return
     tag = f"{context_ts or ''} {context_name or ''}".strip()
+
+    if write_mode not in {"ignore", "upsert"}:
+        raise ValueError(f"未知 write_mode: {write_mode}")
+
+    def _do_upsert() -> int:
+        if df.empty:
+            return 0
+        _ensure_table_has_columns(con, table, df)
+        cols = list(df.columns)
+        quoted_cols = ", ".join([f'"{c}"' for c in cols])
+        placeholders = ", ".join(["?"] * len(cols))
+        conflict_cols = ["ts_code", "trade_date"]
+        if not update_columns:
+            update_cols = [c for c in cols if c not in conflict_cols]
+        else:
+            update_cols = [c for c in update_columns if c in cols]
+        set_sql = ", ".join([f'"{c}"=excluded."{c}"' for c in update_cols])
+        sql = (
+            f'INSERT INTO "{table}" ({quoted_cols}) VALUES ({placeholders}) '
+            f'ON CONFLICT("ts_code","trade_date") DO UPDATE SET {set_sql}'
+        )
+        work = df.copy()
+        work = work.drop_duplicates(subset=conflict_cols)
+        before = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        records = (
+            work.where(pd.notnull(work), None).to_records(index=False).tolist()
+        )
+        con.executemany(sql, records)
+        after = con.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        return int(after - before)
+
     if not _table_exists(con, table):
         df.head(0).to_sql(table, con, if_exists="fail", index=False)
         if "ts_code" in df.columns and "trade_date" in df.columns:
@@ -273,13 +398,17 @@ def _upsert(
                 columns=["ts_code", "trade_date"],
                 index_name=f"{table}_uq",
             )
-        inserted = insert_df_ignore(
-            con,
-            df=df,
-            table=table,
-            unique_by=["ts_code", "trade_date"]
-            if "ts_code" in df.columns and "trade_date" in df.columns
-            else None,
+        inserted = (
+            _do_upsert()
+            if write_mode == "upsert"
+            else insert_df_ignore(
+                con,
+                df=df,
+                table=table,
+                unique_by=["ts_code", "trade_date"]
+                if "ts_code" in df.columns and "trade_date" in df.columns
+                else None,
+            )
         )
         logger.info("[新建] %-14s %-22s 写入 %6d 行", table, tag, inserted)
     else:
@@ -290,13 +419,17 @@ def _upsert(
                 columns=["ts_code", "trade_date"],
                 index_name=f"{table}_uq",
             )
-        inserted = insert_df_ignore(
-            con,
-            df=df,
-            table=table,
-            unique_by=["ts_code", "trade_date"]
-            if "ts_code" in df.columns and "trade_date" in df.columns
-            else None,
+        inserted = (
+            _do_upsert()
+            if write_mode == "upsert"
+            else insert_df_ignore(
+                con,
+                df=df,
+                table=table,
+                unique_by=["ts_code", "trade_date"]
+                if "ts_code" in df.columns and "trade_date" in df.columns
+                else None,
+            )
         )
         logger.info(
             "[追加] %-14s %-22s 新增 %6d 行 (请求 %d)",
@@ -456,17 +589,79 @@ def _sync_one_table(
             raise RuntimeError(f"{table_key} 缺少 ts_codes 或 stock_table 配置")
         if not _table_exists(con, stock_table):
             raise RuntimeError(f"缺少 {stock_table}, 请先运行 tushare_sync_basic.py")
-        stock_df = con.execute(f"SELECT ts_code, name FROM {stock_table}").fetchdf()
+        code_column = str(cfg.get("code_column") or "ts_code").strip()
+        preferred_name_col = str(cfg.get("name_column") or "").strip() or None
+        cols = set(_get_table_columns(con, stock_table))
+        if code_column not in cols:
+            raise RuntimeError(
+                f"{table_key} 需要代码列 {stock_table}.{code_column}, "
+                "但未找到。请先更新/重建基础表并重新同步。"
+            )
+        name_col = None
+        if preferred_name_col and preferred_name_col in cols:
+            name_col = preferred_name_col
+        else:
+            for c in ("name", "csname", "cname", "fullname", "enname"):
+                if c in cols:
+                    name_col = c
+                    break
+        if code_column == "ts_code":
+            if name_col:
+                stock_df = pd.read_sql_query(
+                    f"""
+                    SELECT ts_code, "{name_col}" AS name
+                    FROM "{stock_table}"
+                    WHERE ts_code IS NOT NULL AND TRIM(ts_code) <> ''
+                    """,
+                    con,
+                )
+            else:
+                stock_df = pd.read_sql_query(
+                    f"""
+                    SELECT ts_code, ts_code AS name
+                    FROM "{stock_table}"
+                    WHERE ts_code IS NOT NULL AND TRIM(ts_code) <> ''
+                    """,
+                    con,
+                )
+        else:
+            if name_col:
+                stock_df = pd.read_sql_query(
+                    f"""
+                    SELECT "{code_column}" AS ts_code, MIN("{name_col}") AS name
+                    FROM "{stock_table}"
+                    WHERE "{code_column}" IS NOT NULL AND TRIM("{code_column}") <> ''
+                    GROUP BY "{code_column}"
+                    """,
+                    con,
+                )
+            else:
+                stock_df = pd.read_sql_query(
+                    f"""
+                    SELECT "{code_column}" AS ts_code, MIN("{code_column}") AS name
+                    FROM "{stock_table}"
+                    WHERE "{code_column}" IS NOT NULL AND TRIM("{code_column}") <> ''
+                    GROUP BY "{code_column}"
+                    """,
+                    con,
+                )
+        stock_df = stock_df.dropna(subset=["ts_code"])
+        stock_df = stock_df[stock_df.ts_code.astype(str).str.strip() != ""]
         if table_key == "fx_daily" and RUNTIME_FX_CODES is not None:
             stock_df = stock_df[stock_df.ts_code.isin(RUNTIME_FX_CODES)]
     total = len(stock_df)
     logger.info("[%s] 股票数=%d limit=%d sleep=%.4f", target_table, total, limit, sleep)
     processed = 0
+    backfill_cols = list(cfg.get("backfill_if_missing_columns") or [])
+    force_backfill = False
+    if backfill_cols and _table_exists(con, target_table):
+        existing_cols = set(_get_table_columns(con, target_table))
+        force_backfill = any(c not in existing_cols for c in backfill_cols)
     con.execute("BEGIN")
     for row in stock_df.itertuples(index=False):
         ts_code: str = row.ts_code
         last_sync = _get_last_sync(con, target_table, ts_code)
-        if last_sync == today:
+        if last_sync == today and not force_backfill:
             continue
         latest = _get_latest_date(con, target_table, ts_code)
         start_date = (
@@ -474,6 +669,13 @@ def _sync_one_table(
             if latest
             else START_DATE
         )
+        # 新增字段回填：如果目标表缺列，回拉“已有最早日期~today”补齐
+        if force_backfill:
+            earliest = _get_earliest_date(con, target_table, ts_code)
+            if earliest:
+                start_date = earliest
+            else:
+                start_date = START_DATE
         if start_date > today:
             _set_last_sync(con, target_table, ts_code, today)
             continue
@@ -497,6 +699,8 @@ def _sync_one_table(
                 target_table,
                 context_ts=ts_code,
                 context_name=getattr(row, "name", None),
+                write_mode=str(cfg.get("write_mode") or "ignore"),
+                update_columns=list(cfg.get("update_columns") or []) or None,
             )
             new_latest = _get_latest_date(con, target_table, ts_code)
             wrote_new = new_latest != before_latest
@@ -544,7 +748,7 @@ def _parse_args() -> argparse.Namespace:
         "--table",
         dest="tables",
         nargs="*",
-        help="指定目标表 (可多选)。表: daily_a adj_factor_a bak_daily_a daily_h adj_factor_h fx_daily index_daily index_global (缺省=全部)",
+        help="指定目标表 (可多选)。表: daily_a adj_factor_a bak_daily_a daily_h adj_factor_h etf_daily adj_factor_etf index_daily_etf fx_daily index_daily index_global (缺省=全部)",
     )
     p.add_argument(
         "--fx-codes",

@@ -1,4 +1,4 @@
-﻿# TuShare 日频增量同步（A/H/FX/指数）`tushare_sync_daily.py`
+﻿# TuShare 日频增量同步（A/H/ETF/FX/指数）`tushare_sync_daily.py`
 
 对应脚本：`src/data_fetcher/tushare_sync_daily.py`  
 目标数据库：`data/data.sqlite`  
@@ -10,6 +10,9 @@
 - `bak_daily_a`：A 股特色扩展行情（TuShare `bak_daily`）
 - `daily_h`：港股日线（TuShare `hk_daily`）
 - `adj_factor_h`：港股复权因子（TuShare `hk_daily_adj`）
+- `etf_daily`：ETF 日线行情（TuShare `fund_daily`，代码来源 `etf_basic`）
+- `adj_factor_etf`：ETF 复权因子（TuShare `fund_adj`，代码来源 `etf_basic`，含 `discount_rate` 溢价率字段）
+- `index_daily_etf`：ETF 对应指数日线（TuShare `index_daily`，代码来源 `etf_basic.index_code`，目标表内 `ts_code=指数代码`）
 - `fx_daily`：外汇日线（TuShare `fx_daily`，代码来源 `fx_basic`）
 - `index_daily`：国内指数日线（TuShare `index_daily`，当前仅 `000300.SH`）
 - `index_global`：国际/全球指数日线（TuShare `index_global`，当前仅 `HSI`、`IXIC`）
@@ -25,7 +28,7 @@
 如只跑“日频增量”（不跑基础表/不 vacuum）：
 - `python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync()"`
 
-注意：日频脚本默认依赖基础表 `stock_basic_a / stock_basic_h / fx_basic` 作为代码池；若缺少会报错并提示先运行基础同步脚本。
+注意：日频脚本默认依赖基础表 `stock_basic_a / stock_basic_h / etf_basic / fx_basic` 作为代码池；若缺少会报错并提示先运行基础同步脚本。
 
 ---
 
@@ -35,6 +38,8 @@
 由 `TABLE_CONFIG` 决定：
 - A 股相关：从 `stock_basic_a` 读取 `ts_code`
 - 港股相关：从 `stock_basic_h` 读取 `ts_code`
+- ETF：从 `etf_basic` 读取 `ts_code`
+- ETF 对应指数：从 `etf_basic` 读取 `index_code`，去重后作为 `ts_code` 拉取 `index_daily`
 - 外汇：从 `fx_basic` 读取 `ts_code`（可通过 CLI `--fx-codes` 过滤）
 - 指数：当前使用显式 `ts_codes` 列表（见 `TABLE_CONFIG['index_daily'/'index_global']`）
 
@@ -94,7 +99,7 @@ CREATE TABLE IF NOT EXISTS sync_date (
 
 脚本支持选择同步哪些表，以及外汇代码过滤（见 `main()` / `_parse_args()`）：
 - `-t/--table`：指定目标表（可多选）；缺省=全部
-  - 可选值：`daily_a adj_factor_a bak_daily_a daily_h adj_factor_h fx_daily index_daily index_global`
+  - 可选值：`daily_a adj_factor_a bak_daily_a daily_h adj_factor_h etf_daily adj_factor_etf index_daily_etf fx_daily index_daily index_global`
 - `--fx-codes`：过滤外汇代码（源自 `fx_basic`）
   - `all`：使用 `fx_basic` 全量（默认行为）
   - `none`：不拉取 `fx_daily`
@@ -118,6 +123,9 @@ PYTHONPATH=src python -m data_fetcher.tushare_sync_daily --fx-codes none
 | `bak_daily_a` | `bak_daily` | `stock_basic_a` |
 | `daily_h` | `hk_daily` | `stock_basic_h` |
 | `adj_factor_h` | `hk_daily_adj` | `stock_basic_h` |
+| `etf_daily` | `fund_daily` | `etf_basic` |
+| `adj_factor_etf` | `fund_adj` | `etf_basic` |
+| `index_daily_etf` | `index_daily` | `etf_basic.index_code`（去重后作为 `ts_code`） |
 | `fx_daily` | `fx_daily` | `fx_basic` |
 | `index_daily` | `index_daily` | 显式 `ts_codes`（当前 `000300.SH`） |
 | `index_global` | `index_global` | 显式 `ts_codes`（当前 `HSI`、`IXIC`） |
