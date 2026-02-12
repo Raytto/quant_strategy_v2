@@ -4,7 +4,7 @@ import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
 
 from qs.sqlite_utils import connect_sqlite
 
@@ -90,6 +90,51 @@ def load_calendar_bars_from_sqlite(
     GROUP BY 1
     ORDER BY 1
     """
+    con = connect_sqlite(db_path, read_only=True)
+    try:
+        rows = con.execute(sql, params).fetchall()
+    finally:
+        con.close()
+    return [Bar(*r) for r in rows]
+
+
+def load_calendar_bars_for_symbols_from_sqlite(
+    *,
+    db_path: str | Path,
+    table: str,
+    symbols: Sequence[str],
+    start_date: str,
+    end_date: str | None = None,
+) -> list[Bar]:
+    """Load a multi-symbol trading calendar from a single OHLC table.
+
+    This is commonly used for multi-asset strategies where the bar's `trade_date`
+    is the primary driver, and marks/execution prices are loaded separately
+    (e.g. via the strategy's own DB lookups).
+    """
+    syms = [str(s).strip() for s in symbols if str(s).strip()]
+    if not syms:
+        raise ValueError("symbols must not be empty")
+
+    where = ["trade_date >= ?", f"ts_code IN ({','.join([repr(s) for s in syms])})"]
+    params: list[Any] = [start_date]
+    if end_date:
+        where.append("trade_date <= ?")
+        params.append(end_date)
+
+    sql = f"""
+    SELECT trade_date,
+           MIN(open)  AS open,
+           MIN(high)  AS high,
+           MIN(low)   AS low,
+           MIN(close) AS close,
+           NULL       AS pct_chg
+    FROM "{table}"
+    WHERE {" AND ".join(where)}
+    GROUP BY 1
+    ORDER BY 1
+    """
+
     con = connect_sqlite(db_path, read_only=True)
     try:
         rows = con.execute(sql, params).fetchall()

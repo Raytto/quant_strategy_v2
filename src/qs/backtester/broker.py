@@ -1,8 +1,30 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+import re
+from typing import List, Optional, Dict, Iterable
 
 from .defaults import DEFAULT_INITIAL_CASH, DEFAULT_MIN_COMMISSION
+
+
+_TS_CODE_RE = re.compile(r"^(?P<code>\d{6})\.(?P<exch>SH|SZ)$")
+
+
+def _infer_is_cn_etf_ts_code(symbol: str) -> bool:
+    """Heuristic to identify China exchange-traded funds from ts_code.
+
+    Goal: waive stamp duty (tax_rate) for ETF trades while keeping stock fees unchanged.
+    This is intentionally conservative: unknown formats default to "not ETF".
+    """
+    m = _TS_CODE_RE.match((symbol or "").strip().upper())
+    if not m:
+        return False
+    code = m.group("code")
+    exch = m.group("exch")
+    if exch == "SH":
+        # Common Shanghai ETF / fund prefixes: 51x/52x/56x/58x (incl. STAR ETF 588xxx)
+        return code.startswith(("51", "52", "56", "58"))
+    # SZ: 15xxxx (ETF), 16xxxx (LOF/ETF-like)
+    return code.startswith(("15", "16"))
 
 
 @dataclass
@@ -41,9 +63,9 @@ class CommissionInfo:
         # 仅佣金
         return max(gross_amount * self.commission_rate, self.min_commission)
 
-    def sell_fees(self, gross_amount: float) -> float:
+    def sell_fees(self, gross_amount: float, *, tax_exempt: bool = False) -> float:
         commission = max(gross_amount * self.commission_rate, self.min_commission)
-        tax = gross_amount * self.tax_rate
+        tax = 0.0 if tax_exempt else (gross_amount * self.tax_rate)
         return commission + tax
 
 
@@ -75,6 +97,7 @@ class Broker:
         slippage: float = 0.0002,
         min_commission: float = DEFAULT_MIN_COMMISSION,
         symbol: str = "",
+        tax_exempt_symbols: Iterable[str] | None = None,
     ):
         self.cash = cash
         # legacy single position references default symbol; real storage in positions dict
@@ -93,6 +116,7 @@ class Broker:
         self._slippage_model = SlippageModel(slippage)
         # last mark prices per symbol for equity calc
         self.last_prices: Dict[str, float] = {}
+        self.tax_exempt_symbols = {str(s).strip().upper() for s in (tax_exempt_symbols or []) if str(s).strip()}
 
     # -------------------- position helpers -------------------------------------
     def _get_position(self, symbol: str) -> Position:
@@ -131,6 +155,12 @@ class Broker:
                 f"size={record.size:.0f} gross={record.gross_amount:.2f} fees={record.fees:.2f} "
                 f"cash={record.cash_after:.2f} pos={record.position_after:.0f} eq={record.equity_after:.2f}"
             )
+
+    def _is_tax_exempt(self, symbol: str) -> bool:
+        sym = (symbol or "").strip().upper()
+        if sym in self.tax_exempt_symbols:
+            return True
+        return _infer_is_cn_etf_ts_code(sym)
 
     # -------------------- 强制核销 (退市/清零) ---------------------------------
     def force_write_off(self, trade_date: str, symbol: str, reason: str = "delist"):
@@ -218,7 +248,7 @@ class Broker:
             size = int(pos.size)
         exec_price = self._slippage_model.adjust_price(price, "SELL")
         gross_proceeds = exec_price * size
-        fees = self._commission.sell_fees(gross_proceeds)
+        fees = self._commission.sell_fees(gross_proceeds, tax_exempt=self._is_tax_exempt(symbol))
         net_in = gross_proceeds - fees
         self.cash += net_in
         pos.size -= size

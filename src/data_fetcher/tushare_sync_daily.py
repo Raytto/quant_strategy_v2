@@ -45,6 +45,10 @@ DEFAULT_SLEEP = 0.01
 DEFAULT_SLEEP_ON_FAIL = 2  # 或者 DEFAULT_SLEEP * 2
 MAX_RETRY = 3
 BATCH_SIZE = 100  # 每 100 只股票提交一次事务
+# Tushare Pro `limit` is effectively capped (commonly 2000). When our configured
+# limit exceeds the API cap, the first page may return <limit rows even though
+# more pages exist; pagination must use the effective page size.
+TS_API_MAX_PAGE_SIZE = 2000
 
 # ───────────────────────────────────────────── 目标表配置 (平铺) ──
 # key = 目标表名 (亦作 CLI 指定名)
@@ -84,6 +88,11 @@ TABLE_CONFIG: Dict[str, Dict[str, Any]] = {
         ],
         "stock_table": "etf_basic",
         "name_column": "csname",
+        # etf_basic often contains duplicated `.OF` rows for the same 6-digit code.
+        # fund_daily/fund_adj data we use are exchange-listed; prefer those.
+        "ts_code_suffix_whitelist": [".SZ", ".SH", ".BJ"],
+        # Skip pending/delisted products to avoid empty backfills.
+        "require_list_status": ["L"],
         "limit": 6000,
     },
     "adj_factor_etf": {  # ETF 复权因子 (代码池: etf_basic)
@@ -91,6 +100,8 @@ TABLE_CONFIG: Dict[str, Dict[str, Any]] = {
         "fields": ["ts_code", "trade_date", "adj_factor", "discount_rate"],
         "stock_table": "etf_basic",
         "name_column": "csname",
+        "ts_code_suffix_whitelist": [".SZ", ".SH", ".BJ"],
+        "require_list_status": ["L"],
         "limit": 6000,
         "write_mode": "upsert",
         "update_columns": ["adj_factor", "discount_rate"],
@@ -460,13 +471,17 @@ def _fetch_api_with_paging(
     sleep_on_fail: float,
 ) -> pd.DataFrame:
     """分页 + 重试 + pandas is_unique 兜底(日颗粒)。支持 per-table limit/sleep。"""
+    page_limit = min(int(limit), TS_API_MAX_PAGE_SIZE)
     offset, chunks = 0, []
     while True:
         df_chunk = None
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 df_chunk = getattr(pro, api_name)(
-                    **params, offset=offset, limit=limit, fields=",".join(fields)
+                    **params,
+                    offset=offset,
+                    limit=page_limit,
+                    fields=",".join(fields),
                 )
                 break
             except AttributeError as exc:
@@ -504,9 +519,9 @@ def _fetch_api_with_paging(
         if df_chunk is None:
             raise RuntimeError(f"{api_name} 连续 {MAX_RETRY} 次失败")
         chunks.append(df_chunk)
-        if len(df_chunk) < limit:
+        if len(df_chunk) < page_limit:
             return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
-        offset += limit
+        offset += page_limit
         time.sleep(sleep)
 
     # 第二阶段: 日颗粒兜底
@@ -527,7 +542,10 @@ def _fetch_api_with_paging(
         for attempt in range(1, MAX_RETRY + 1):
             try:
                 df_day = getattr(pro, api_name)(
-                    **day_params, offset=0, limit=limit, fields=",".join(fields)
+                    **day_params,
+                    offset=0,
+                    limit=page_limit,
+                    fields=",".join(fields),
                 )
                 if not df_day.empty:
                     daily_chunks.append(df_day)
@@ -562,11 +580,34 @@ def _iter_tables(selected: Optional[Iterable[str]]) -> Iterable[str]:
         yield name
 
 
+def _normalize_yyyymmdd(value: object | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if len(s) != 8 or not s.isdigit():
+        return None
+    return s
+
+
+def _max_yyyymmdd(a: str | None, b: str | None) -> str | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
 def _sync_one_table(
     pro: ts.pro_api,
     con: sqlite3.Connection,
     table_key: str,
     today: str,
+    *,
+    ts_codes_filter: Optional[set[str]] = None,
+    rebuild: bool = False,
+    backfill_history: bool = False,
 ) -> None:
     cfg = TABLE_CONFIG[table_key]
     target_table = table_key
@@ -592,6 +633,9 @@ def _sync_one_table(
         code_column = str(cfg.get("code_column") or "ts_code").strip()
         preferred_name_col = str(cfg.get("name_column") or "").strip() or None
         cols = set(_get_table_columns(con, stock_table))
+        has_list_date = "list_date" in cols
+        has_setup_date = "setup_date" in cols
+        has_list_status = "list_status" in cols
         if code_column not in cols:
             raise RuntimeError(
                 f"{table_key} 需要代码列 {stock_table}.{code_column}, "
@@ -605,22 +649,32 @@ def _sync_one_table(
                 if c in cols:
                     name_col = c
                     break
+        date_select_parts: list[str] = []
+        if has_list_date:
+            date_select_parts.append('MIN("list_date") AS list_date')
+        if has_setup_date:
+            date_select_parts.append('MIN("setup_date") AS setup_date')
+        if has_list_status:
+            date_select_parts.append('MIN("list_status") AS list_status')
+        date_select = (", " + ", ".join(date_select_parts)) if date_select_parts else ""
         if code_column == "ts_code":
             if name_col:
                 stock_df = pd.read_sql_query(
                     f"""
-                    SELECT ts_code, "{name_col}" AS name
+                    SELECT ts_code, MIN("{name_col}") AS name{date_select}
                     FROM "{stock_table}"
                     WHERE ts_code IS NOT NULL AND TRIM(ts_code) <> ''
+                    GROUP BY ts_code
                     """,
                     con,
                 )
             else:
                 stock_df = pd.read_sql_query(
                     f"""
-                    SELECT ts_code, ts_code AS name
+                    SELECT ts_code, MIN(ts_code) AS name{date_select}
                     FROM "{stock_table}"
                     WHERE ts_code IS NOT NULL AND TRIM(ts_code) <> ''
+                    GROUP BY ts_code
                     """,
                     con,
                 )
@@ -628,7 +682,7 @@ def _sync_one_table(
             if name_col:
                 stock_df = pd.read_sql_query(
                     f"""
-                    SELECT "{code_column}" AS ts_code, MIN("{name_col}") AS name
+                    SELECT "{code_column}" AS ts_code, MIN("{name_col}") AS name{date_select}
                     FROM "{stock_table}"
                     WHERE "{code_column}" IS NOT NULL AND TRIM("{code_column}") <> ''
                     GROUP BY "{code_column}"
@@ -638,7 +692,7 @@ def _sync_one_table(
             else:
                 stock_df = pd.read_sql_query(
                     f"""
-                    SELECT "{code_column}" AS ts_code, MIN("{code_column}") AS name
+                    SELECT "{code_column}" AS ts_code, MIN("{code_column}") AS name{date_select}
                     FROM "{stock_table}"
                     WHERE "{code_column}" IS NOT NULL AND TRIM("{code_column}") <> ''
                     GROUP BY "{code_column}"
@@ -649,6 +703,18 @@ def _sync_one_table(
         stock_df = stock_df[stock_df.ts_code.astype(str).str.strip() != ""]
         if table_key == "fx_daily" and RUNTIME_FX_CODES is not None:
             stock_df = stock_df[stock_df.ts_code.isin(RUNTIME_FX_CODES)]
+
+    suffix_whitelist = cfg.get("ts_code_suffix_whitelist")
+    if suffix_whitelist:
+        suffixes = tuple(str(s) for s in suffix_whitelist)
+        stock_df = stock_df[stock_df.ts_code.astype(str).str.endswith(suffixes)]
+
+    require_list_status = cfg.get("require_list_status")
+    if require_list_status and "list_status" in stock_df.columns:
+        allowed = {str(s) for s in require_list_status}
+        stock_df = stock_df[stock_df["list_status"].astype(str).isin(allowed)]
+    if ts_codes_filter:
+        stock_df = stock_df[stock_df.ts_code.isin(ts_codes_filter)]
     total = len(stock_df)
     logger.info("[%s] 股票数=%d limit=%d sleep=%.4f", target_table, total, limit, sleep)
     processed = 0
@@ -660,56 +726,125 @@ def _sync_one_table(
     con.execute("BEGIN")
     for row in stock_df.itertuples(index=False):
         ts_code: str = row.ts_code
-        last_sync = _get_last_sync(con, target_table, ts_code)
-        if last_sync == today and not force_backfill:
-            continue
-        latest = _get_latest_date(con, target_table, ts_code)
-        start_date = (
-            (pd.to_datetime(latest) + timedelta(days=1)).strftime("%Y%m%d")
-            if latest
-            else START_DATE
-        )
-        # 新增字段回填：如果目标表缺列，回拉“已有最早日期~today”补齐
-        if force_backfill:
+        try:
+            row_list_date = _normalize_yyyymmdd(getattr(row, "list_date", None))
+            row_setup_date = _normalize_yyyymmdd(getattr(row, "setup_date", None))
+            row_min_date = row_list_date or row_setup_date
+            # Prefer per-symbol listing date (avoid wasting calls before listing).
+            desired_min_date = _max_yyyymmdd(START_DATE, row_min_date)
+            if rebuild:
+                con.execute(f'DELETE FROM "{target_table}" WHERE ts_code=?', [ts_code])
+                con.execute(
+                    "DELETE FROM sync_date WHERE table_name=? AND ts_code=?",
+                    [target_table, ts_code],
+                )
+            last_sync = _get_last_sync(con, target_table, ts_code)
             earliest = _get_earliest_date(con, target_table, ts_code)
-            if earliest:
-                start_date = earliest
+            want_backfill = (
+                backfill_history
+                and not rebuild
+                and desired_min_date is not None
+                and earliest is not None
+                and desired_min_date < str(earliest)
+            )
+            if (
+                last_sync == today
+                and not force_backfill
+                and not rebuild
+                and not want_backfill
+            ):
+                continue
+            latest = _get_latest_date(con, target_table, ts_code)
+            start_date = (
+                (pd.to_datetime(latest) + timedelta(days=1)).strftime("%Y%m%d")
+                if latest
+                else (desired_min_date or START_DATE)
+            )
+            # 新增字段回填：如果目标表缺列，回拉“已有最早日期~today”补齐
+            if force_backfill:
+                if earliest:
+                    start_date = earliest
+                else:
+                    start_date = desired_min_date or START_DATE
+            if start_date > today:
+                _set_last_sync(con, target_table, ts_code, today)
+                continue
+            params = {"ts_code": ts_code, "start_date": start_date, "end_date": today}
+            df = _fetch_api_with_paging(
+                pro,
+                cfg["api_name"],
+                params,
+                cfg["fields"],
+                limit=limit,
+                sleep=sleep,
+                sleep_on_fail=sleep_on_fail,
+            )
+            wrote_new = False
+            if not df.empty:
+                df.sort_values("trade_date", inplace=True)
+                before_latest = latest
+                _upsert(
+                    con,
+                    df,
+                    target_table,
+                    context_ts=ts_code,
+                    context_name=getattr(row, "name", None),
+                    write_mode=str(cfg.get("write_mode") or "ignore"),
+                    update_columns=list(cfg.get("update_columns") or []) or None,
+                )
+                new_latest = _get_latest_date(con, target_table, ts_code)
+                wrote_new = new_latest != before_latest
             else:
-                start_date = START_DATE
-        if start_date > today:
-            _set_last_sync(con, target_table, ts_code, today)
-            continue
-        params = {"ts_code": ts_code, "start_date": start_date, "end_date": today}
-        df = _fetch_api_with_paging(
-            pro,
-            cfg["api_name"],
-            params,
-            cfg["fields"],
-            limit=limit,
-            sleep=sleep,
-            sleep_on_fail=sleep_on_fail,
-        )
-        wrote_new = False
-        if not df.empty:
-            df.sort_values("trade_date", inplace=True)
-            before_latest = latest
-            _upsert(
-                con,
-                df,
-                target_table,
-                context_ts=ts_code,
-                context_name=getattr(row, "name", None),
-                write_mode=str(cfg.get("write_mode") or "ignore"),
-                update_columns=list(cfg.get("update_columns") or []) or None,
-            )
-            new_latest = _get_latest_date(con, target_table, ts_code)
-            wrote_new = new_latest != before_latest
-        else:
-            logger.debug(
-                "[%s] %s 无数据返回 start=%s", target_table, ts_code, start_date
-            )
-        if wrote_new or start_date < today:
-            _set_last_sync(con, target_table, ts_code, today)
+                logger.debug(
+                    "[%s] %s 无数据返回 start=%s", target_table, ts_code, start_date
+                )
+
+            # 历史补齐：若本地最早 trade_date 晚于 desired_min_date，则回拉缺失区间
+            if want_backfill and desired_min_date is not None:
+                earliest_now = _get_earliest_date(con, target_table, ts_code)
+                if earliest_now is not None and desired_min_date < str(earliest_now):
+                    backfill_end = (
+                        pd.to_datetime(str(earliest_now)) - timedelta(days=1)
+                    ).strftime("%Y%m%d")
+                    if desired_min_date <= backfill_end:
+                        logger.info(
+                            "[%s] %s backfill %s~%s",
+                            target_table,
+                            ts_code,
+                            desired_min_date,
+                            backfill_end,
+                        )
+                        backfill_params = {
+                            "ts_code": ts_code,
+                            "start_date": desired_min_date,
+                            "end_date": backfill_end,
+                        }
+                        df_old = _fetch_api_with_paging(
+                            pro,
+                            cfg["api_name"],
+                            backfill_params,
+                            cfg["fields"],
+                            limit=limit,
+                            sleep=sleep,
+                            sleep_on_fail=sleep_on_fail,
+                        )
+                        if not df_old.empty:
+                            df_old.sort_values("trade_date", inplace=True)
+                            _upsert(
+                                con,
+                                df_old,
+                                target_table,
+                                context_ts=ts_code,
+                                context_name=getattr(row, "name", None),
+                                write_mode=str(cfg.get("write_mode") or "ignore"),
+                                update_columns=list(cfg.get("update_columns") or []) or None,
+                            )
+            if wrote_new or start_date < today:
+                _set_last_sync(con, target_table, ts_code, today)
+        except Exception as exc:
+            logger.warning("[%s] %s 同步失败: %s", target_table, ts_code, exc, exc_info=True)
+            con.execute("ROLLBACK")
+            con.execute("BEGIN")
         processed += 1
         if processed % 10 == 0 or processed == total:
             logger.info(
@@ -729,12 +864,29 @@ def _sync_one_table(
 # ───────────────────────────────────────────── 顶层入口 ──
 
 
-def sync(tables: Optional[Iterable[str]] = None) -> None:
+def sync(
+    tables: Optional[Iterable[str]] = None,
+    *,
+    ts_codes: Optional[Iterable[str]] = None,
+    rebuild: bool = False,
+    backfill_history: bool = False,
+) -> None:
     pro = ts.pro_api(get_tushare_token())
     today = datetime.now().strftime("%Y%m%d")
+    ts_filter = set(ts_codes) if ts_codes else None
+    if rebuild and not ts_filter:
+        raise ValueError("rebuild=True requires ts_codes")
     with _connect() as con:
         for table_key in _iter_tables(tables):
-            _sync_one_table(pro, con, table_key, today)
+            _sync_one_table(
+                pro,
+                con,
+                table_key,
+                today,
+                ts_codes_filter=ts_filter,
+                rebuild=bool(rebuild),
+                backfill_history=bool(backfill_history),
+            )
     logger.info("全部完成")
 
 
@@ -756,6 +908,24 @@ def _parse_args() -> argparse.Namespace:
         nargs="*",
         help="过滤外汇代码 (源自 fx_basic)。使用空或 all=保留全部；指定 none=不拉 fx_daily",
     )
+    p.add_argument(
+        "--ts-codes",
+        dest="ts_codes",
+        nargs="*",
+        help="过滤 ts_code（对 etf_daily/adj_factor_etf 等有效）。不指定=使用基础表全量。",
+    )
+    p.add_argument(
+        "--rebuild",
+        dest="rebuild",
+        action="store_true",
+        help="重建指定 ts_codes 的该表数据：先 DELETE 再全量回拉（需配合 --ts-codes）。",
+    )
+    p.add_argument(
+        "--backfill",
+        dest="backfill",
+        action="store_true",
+        help="补齐历史数据：若本地最早 trade_date 晚于 list_date/START_DATE，则回拉缺失的更早区间。",
+    )
     return p.parse_args()
 
 
@@ -769,7 +939,14 @@ def main() -> None:
             RUNTIME_FX_CODES = []
         else:
             RUNTIME_FX_CODES = args.fx_codes
-    sync(args.tables)
+    if args.rebuild and not args.ts_codes:
+        raise SystemExit("--rebuild requires --ts-codes")
+    sync(
+        args.tables,
+        ts_codes=args.ts_codes,
+        rebuild=bool(args.rebuild),
+        backfill_history=bool(args.backfill),
+    )
 
 
 if __name__ == "__main__":  # pragma: no cover

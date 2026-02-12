@@ -22,15 +22,21 @@ fi
 
 if [[ -n "${CONDA_BIN}" ]]; then
   if [[ "${MODE}" == "all" ]]; then
-    "${CONDA_BIN}" run -n "${ENV_NAME}" python scripts/fetch_data.py
+    "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python scripts/fetch_data.py
+  elif [[ "${MODE}" == "etf_backfill" ]]; then
+    "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_basic import data_sync; data_sync()"
+    "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync(['etf_daily','adj_factor_etf','index_daily_etf'], backfill_history=True)"
   else
-    "${CONDA_BIN}" run -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_basic import data_sync; data_sync()"
-    "${CONDA_BIN}" run -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync(['etf_daily','adj_factor_etf','index_daily_etf'])"
+    "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_basic import data_sync; data_sync()"
+    "${CONDA_BIN}" run --no-capture-output -n "${ENV_NAME}" python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync(['etf_daily','adj_factor_etf','index_daily_etf'])"
   fi
 else
   echo "WARN: conda not found in PATH; running with current python (ignoring env name: ${ENV_NAME})." >&2
   if [[ "${MODE}" == "all" ]]; then
     python scripts/fetch_data.py
+  elif [[ "${MODE}" == "etf_backfill" ]]; then
+    python -c "import _bootstrap; from data_fetcher.tushare_sync_basic import data_sync; data_sync()"
+    python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync(['etf_daily','adj_factor_etf','index_daily_etf'], backfill_history=True)"
   else
     python -c "import _bootstrap; from data_fetcher.tushare_sync_basic import data_sync; data_sync()"
     python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import sync; sync(['etf_daily','adj_factor_etf','index_daily_etf'])"

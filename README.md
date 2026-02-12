@@ -21,6 +21,12 @@
 - Or (no conda): `python scripts/fetch_data.py`
 - Or (explicit): `conda run -n myqs python scripts/fetch_data.py`
 
+### 3.5) Backfill a few ETFs (optional)
+
+If some ETFs only have ~1y history in `data/data.sqlite`, you can rebuild just those symbols for `etf_daily` + `adj_factor_etf`:
+
+- `conda run -n myqs python -c "import _bootstrap; from data_fetcher.tushare_sync_daily import main; main()" -t etf_daily adj_factor_etf --ts-codes 159001.SZ 159922.SZ 159934.SZ 159941.SZ 159905.SZ --rebuild`
+
 ### 4) Run tests
 
 - `conda run -n myqs pytest`
