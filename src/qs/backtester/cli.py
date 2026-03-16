@@ -13,6 +13,7 @@ from .runner import (
     write_trades_csv,
 )
 from .defaults import DEFAULT_INITIAL_CASH
+from .market import SqliteMarketData
 
 
 def _parse_args() -> argparse.Namespace:
@@ -76,14 +77,19 @@ def main() -> None:
         default_tag = args.strategy.split(":")[-1].split(".")[-1]
         default_symbol = ""
 
-    res = run_backtest(
-        bars=bars,
-        strategy=strategy,
-        initial_cash=args.cash,
-        symbol=default_symbol,
-        enable_trade_log=bool(args.log_trades),
-        mark_error_policy=args.mark_error_policy,
-    )
+    market_data = SqliteMarketData(args.db)
+    try:
+        res = run_backtest(
+            bars=bars,
+            strategy=strategy,
+            initial_cash=args.cash,
+            symbol=default_symbol,
+            enable_trade_log=bool(args.log_trades),
+            mark_error_policy=args.mark_error_policy,
+            market_data=market_data,
+        )
+    finally:
+        market_data.close()
 
     tag = args.tag or default_tag
     out_dir = args.out_dir

@@ -1,6 +1,7 @@
 from .data import Bar, DataFeed
 from .broker import Broker, Position, TradeRecord
 from .engine import BacktestEngine, EquityPoint, Strategy
+from .market import PriceRequest, SqliteMarketData, StrategyContext
 from .stats import (
     compute_annual_returns,
     compute_daily_returns,
@@ -17,9 +18,11 @@ __all__ = [
     "BacktestEngine",
     "EquityPoint",
     "Strategy",
+    "PriceRequest",
+    "SqliteMarketData",
+    "StrategyContext",
     "compute_annual_returns",
     "compute_daily_returns",
     "compute_max_drawdown",
     "compute_risk_metrics",
 ]
-

@@ -33,3 +33,19 @@ def test_etf_sell_has_no_stamp_tax():
     assert last.action == "SELL"
     # ETF: no stamp duty; only commission (min 5)
     assert abs(last.fees - 5.0) < 1e-9
+
+
+def test_rebalance_raises_when_execution_price_is_missing():
+    broker = Broker(1_000.0, slippage=0.0)
+    broker.buy_sym("20200102", "AAA.SZ", price=10.0, size=10)
+
+    try:
+        broker.rebalance_target_percents(
+            "20200103",
+            {"BBB.SZ": 10.0},
+            {"BBB.SZ": 1.0},
+        )
+    except ValueError as exc:
+        assert "AAA.SZ" in str(exc)
+    else:
+        raise AssertionError("expected missing execution price to raise ValueError")

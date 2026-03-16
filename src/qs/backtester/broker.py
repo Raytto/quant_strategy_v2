@@ -329,6 +329,8 @@ class Broker:
         trade_date: str,
         price_map: Dict[str, float],
         target_weights: Dict[str, float],
+        *,
+        strict_missing_prices: bool = True,
     ):
         """Batch rebalance to target percentage weights (similar to backtrader style).
 
@@ -361,7 +363,11 @@ class Broker:
             target_w = clean_weights.get(sym, 0.0)
             price = price_map.get(sym)
             if price is None or price <= 0:
-                continue  # skip if no executable price
+                if strict_missing_prices:
+                    raise ValueError(
+                        f"missing executable price for {sym} on {trade_date}"
+                    )
+                continue
             exec_price = self._slippage_model.adjust_price(
                 price, "BUY" if target_w > 0 else "SELL"
             )

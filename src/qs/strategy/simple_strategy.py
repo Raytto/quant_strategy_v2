@@ -1,6 +1,6 @@
 from __future__ import annotations
-from qs.backtester.data import DataFeed, Bar
-from qs.backtester.broker import Broker
+
+from qs.backtester.market import PriceRequest, StrategyContext
 
 
 class SimpleStrategy:
@@ -13,13 +13,32 @@ class SimpleStrategy:
 
     def __init__(self, ts_code: str = "601628.SH"):
         self.ts_code = ts_code
+        self._open_request = PriceRequest(
+            table="daily_a",
+            field="open",
+            exact=True,
+        )
+        self._close_request = PriceRequest(
+            table="daily_a",
+            field="close",
+            exact=False,
+        )
 
-    def on_bar(self, bar: Bar, feed: DataFeed, broker: Broker) -> None:
-        prev = feed.prev
-        if prev and prev.pct_chg is not None:
-            if prev.pct_chg >= 1.0:
-                # 目标 100% 仓位
-                broker.order_target_percent(bar.trade_date, bar.open, 1.0)
-            elif prev.pct_chg <= -1.0:
-                broker.close(bar.trade_date, bar.open)
-        # 其余不操作
+    def on_bar_ctx(self, ctx: StrategyContext) -> None:
+        ctx.set_mark_request(self._close_request)
+        if ctx.signal_date is None:
+            return
+        row = ctx.history.get_dataset_values(
+            table="daily_a",
+            symbols=[self.ts_code],
+            fields=["pct_chg"],
+            trade_date=ctx.signal_date,
+            exact=True,
+        ).get(self.ts_code)
+        if not row or row.get("pct_chg") is None:
+            return
+        pct_chg = float(row["pct_chg"])
+        if pct_chg >= 1.0:
+            ctx.rebalance_to_weights({self.ts_code: 1.0}, execution_request=self._open_request)
+        elif pct_chg <= -1.0:
+            ctx.rebalance_to_weights({}, execution_request=self._open_request)

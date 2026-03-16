@@ -12,6 +12,7 @@ from .broker import Broker
 from .data import Bar, DataFeed
 from .defaults import DEFAULT_INITIAL_CASH
 from .engine import BacktestEngine, Strategy
+from .market import SqliteMarketData
 from .stats import compute_annual_returns, compute_max_drawdown, compute_risk_metrics
 
 
@@ -151,11 +152,16 @@ def run_backtest(
     symbol: str = "",
     enable_trade_log: bool = False,
     mark_error_policy: str = "warn",
+    market_data: SqliteMarketData | None = None,
 ) -> BacktestResult:
     feed = DataFeed(bars)
     broker = Broker(initial_cash, enable_trade_log=enable_trade_log, symbol=symbol)
     engine = BacktestEngine(
-        feed, broker, strategy, mark_error_policy=mark_error_policy  # type: ignore[arg-type]
+        feed,
+        broker,
+        strategy,
+        mark_error_policy=mark_error_policy,  # type: ignore[arg-type]
+        market_data=market_data,
     )
     curve = engine.run()
     final_equity = curve[-1].equity if curve else initial_cash
