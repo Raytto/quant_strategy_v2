@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}QS Dashboard{% endblock %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">Quant Strategy Dashboard</p>
+    <h1>策略快照总览</h1>
+    <p>最近刷新时间：{{ last_refresh_at or '尚未刷新' }}</p>
+  </div>
+  <div class="hero-actions">
+    <a class="button" href="{{ site_root }}/strategies">查看策略</a>
+    <a class="button ghost" href="{{ site_root }}/composer">创建组合</a>
+  </div>
+</section>
+
+<section class="stats-grid">
+  <article class="card stat">
+    <span>可用策略</span>
+    <strong>{{ strategies|length }}</strong>
+  </article>
+  <article class="card stat">
+    <span>最近任务</span>
+    <strong>{{ runs|length }}</strong>
+  </article>
+  <article class="card stat">
+    <span>成功快照</span>
+    <strong>{{ strategies|selectattr('latest_run_id')|list|length }}</strong>
+  </article>
+</section>
+
+<section class="triple-grid">
+  <article class="card">
+    <h2>CAGR Top</h2>
+    {% for item in top_cagr %}
+    <div class="list-row">
+      <a href="{{ site_root }}/strategies/{{ item.strategy_key }}">{{ item.display_name }}</a>
+      <span>{{ "%.2f%%"|format(item.metrics.cagr * 100) }}</span>
+    </div>
+    {% endfor %}
+  </article>
+  <article class="card">
+    <h2>Sharpe Top</h2>
+    {% for item in top_sharpe %}
+    <div class="list-row">
+      <a href="{{ site_root }}/strategies/{{ item.strategy_key }}">{{ item.display_name }}</a>
+      <span>{{ "%.2f"|format(item.metrics.sharpe) }}</span>
+    </div>
+    {% endfor %}
+  </article>
+  <article class="card">
+    <h2>回撤控制</h2>
+    {% for item in low_dd %}
+    <div class="list-row">
+      <a href="{{ site_root }}/strategies/{{ item.strategy_key }}">{{ item.display_name }}</a>
+      <span>{{ "%.2f%%"|format(item.metrics.max_drawdown * 100) }}</span>
+    </div>
+    {% endfor %}
+  </article>
+</section>
+
+<section class="card">
+  <h2>最近运行</h2>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>策略</th>
+        <th>标签</th>
+        <th>状态</th>
+        <th>日期</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>{{ run.strategy_key }}</td>
+        <td>{{ run.run_tag }}</td>
+        <td>{{ run.status }}</td>
+        <td>{{ run.completed_at or run.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

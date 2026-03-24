@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}管理员登录{% endblock %}
+{% block content %}
+<section class="auth-layout">
+  <article class="card auth-card">
+    <p class="eyebrow">Login</p>
+    <h1>管理员登录</h1>
+    <p>当前仅开放管理员账号。策略浏览和组合计算保持公开，快照刷新需要管理员权限。</p>
+    {% if error %}
+    <div class="auth-error">{{ error }}</div>
+    {% endif %}
+    <form class="auth-form" method="post" action="{{ site_root }}/login">
+      <label>
+        用户名
+        <input name="username" type="text" value="{{ attempted_username }}" autocomplete="username">
+      </label>
+      <label>
+        密码
+        <input name="password" type="password" autocomplete="current-password">
+      </label>
+      <button class="button" type="submit">登录</button>
+    </form>
+  </article>
+</section>
+{% endblock %}

@@ -26,6 +26,7 @@ class BacktestEngine:
         *,
         mark_error_policy: Literal["raise", "warn", "ignore"] = "warn",
         require_marks_when_positions: bool = True,
+        strict_missing_execution_prices: bool = True,
         market_data: SqliteMarketData | None = None,
     ):
         self.feed = feed
@@ -33,6 +34,7 @@ class BacktestEngine:
         self.strategy = strategy
         self.mark_error_policy = mark_error_policy
         self.require_marks_when_positions = require_marks_when_positions
+        self.strict_missing_execution_prices = strict_missing_execution_prices
         self.market_data = market_data
         self.equity_curve: List[EquityPoint] = []
 
@@ -122,6 +124,7 @@ class BacktestEngine:
             ctx.trade_date,
             price_map,
             dict(ctx.target_weights),
+            strict_missing_prices=self.strict_missing_execution_prices,
         )
 
     def run(self):

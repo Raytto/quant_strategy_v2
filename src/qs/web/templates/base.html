@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}QS Web{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='css/site.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="{{ url_for('static', path='js/charts.js') }}"></script>
+</head>
+<body>
+  <div class="page-shell">
+    <aside class="sidebar">
+      <a class="brand" href="{{ site_root }}/">PP QS</a>
+      <nav>
+        <a href="{{ site_root }}/">总览</a>
+        <a href="{{ site_root }}/strategies">策略</a>
+        <a href="{{ site_root }}/composer">组合器</a>
+        <a href="{{ site_root }}/runs">运行记录</a>
+      </nav>
+      <div class="sidebar-footer">
+        {% if current_user %}
+        <div class="auth-panel">
+          <form method="post" action="{{ site_root }}/logout">
+            <button class="button ghost" type="submit">退出登录</button>
+          </form>
+        </div>
+        {% else %}
+        <div class="auth-panel">
+          <a class="button" href="{{ site_root }}/login">管理员登录</a>
+        </div>
+        {% endif %}
+      </div>
+    </aside>
+    <main class="content">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>

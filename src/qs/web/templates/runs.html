@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}运行记录{% endblock %}
+{% block content %}
+<section class="header-row">
+  <div>
+    <p class="eyebrow">Runs</p>
+    <h1>运行记录</h1>
+  </div>
+</section>
+
+<section class="card">
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>run_id</th>
+        <th>strategy</th>
+        <th>tag</th>
+        <th>status</th>
+        <th>as_of</th>
+        <th>output</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <td>{{ run.run_id }}</td>
+        <td>{{ run.strategy_key }}</td>
+        <td>{{ run.run_tag }}</td>
+        <td>{{ run.status }}</td>
+        <td>{{ run.as_of_date }}</td>
+        <td>{{ run.output_dir }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+{% endblock %}

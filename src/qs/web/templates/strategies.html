@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}策略列表{% endblock %}
+{% block content %}
+<section class="header-row">
+  <div>
+    <p class="eyebrow">Strategies</p>
+    <h1>策略列表</h1>
+  </div>
+</section>
+
+<section class="card-grid">
+  {% for item in strategies %}
+  <article class="card strategy-card">
+    <div class="card-head">
+      <div>
+        <p class="pill">{{ item.category }}</p>
+        <h2><a href="{{ site_root }}/strategies/{{ item.strategy_key }}">{{ item.display_name }}</a></h2>
+      </div>
+      {% if is_admin %}
+      <button class="button ghost js-refresh" data-strategy="{{ item.strategy_key }}">刷新</button>
+      {% endif %}
+    </div>
+    <p>{{ item.description }}</p>
+    <div class="metric-strip">
+      <span>CAGR {{ "%.2f%%"|format(item.metrics.cagr * 100) }}</span>
+      <span>Sharpe {{ "%.2f"|format(item.metrics.sharpe) }}</span>
+      <span>MDD {{ "%.2f%%"|format(item.metrics.max_drawdown * 100) }}</span>
+    </div>
+    <div class="meta-row">
+      <span>持仓 {{ item.holding_count }}</span>
+      <span>{{ item.latest_completed_at or '未运行' }}</span>
+    </div>
+  </article>
+  {% endfor %}
+</section>
+
+<script>
+document.querySelectorAll('.js-refresh').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = '刷新中...';
+    const strategyKey = button.dataset.strategy;
+    const response = await fetch(`${window.location.origin}{{ site_root }}/api/strategies/${strategyKey}/refresh`, {method: 'POST'});
+    button.disabled = false;
+    button.textContent = originalText;
+    if (response.ok) {
+      window.location.reload();
+    } else {
+      let message = '刷新失败';
+      try {
+        const data = await response.json();
+        if (data.detail) {
+          message = data.detail;
+        }
+    } catch (error) {
+    }
+    button.textContent = originalText;
+    alert(message);
+  }
+  });
+});
+</script>
+{% endblock %}

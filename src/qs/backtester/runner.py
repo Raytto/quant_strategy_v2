@@ -152,6 +152,7 @@ def run_backtest(
     symbol: str = "",
     enable_trade_log: bool = False,
     mark_error_policy: str = "warn",
+    strict_missing_execution_prices: bool = True,
     market_data: SqliteMarketData | None = None,
 ) -> BacktestResult:
     feed = DataFeed(bars)
@@ -161,6 +162,7 @@ def run_backtest(
         broker,
         strategy,
         mark_error_policy=mark_error_policy,  # type: ignore[arg-type]
+        strict_missing_execution_prices=strict_missing_execution_prices,
         market_data=market_data,
     )
     curve = engine.run()

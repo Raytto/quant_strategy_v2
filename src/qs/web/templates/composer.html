@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}组合器{% endblock %}
+{% block content %}
+<section class="header-row">
+  <div>
+    <p class="eyebrow">Composer</p>
+    <h1>多策略组合器</h1>
+  </div>
+</section>
+
+<section class="composer-layout">
+  <article class="card">
+    <h2>选择策略</h2>
+    <form id="composer-form">
+      {% for item in strategies %}
+      <label class="check-row">
+        <input type="checkbox" name="strategy" value="{{ item.strategy_key }}">
+        <span>{{ item.display_name }}</span>
+        <small>Sharpe {{ "%.2f"|format(item.metrics.sharpe) }}</small>
+      </label>
+      {% endfor %}
+      <div class="form-grid">
+        <label>Kelly Scale<input name="kelly_scale" type="number" step="0.1" value="0.5"></label>
+        <label>单策略上限<input name="max_strategy_weight" type="number" step="0.1" value="0.6"></label>
+      </div>
+      <label class="check-row">
+        <input type="checkbox" name="allow_cash" checked>
+        <span>允许现金</span>
+      </label>
+      <button class="button" type="submit">计算组合</button>
+    </form>
+  </article>
+
+  <article class="card">
+    <h2>组合结果</h2>
+    <div id="composer-metrics" class="metric-strip vertical">等待计算</div>
+    <div class="chart" id="composer-chart"></div>
+    <h3>历史年度收益</h3>
+    <table class="data-table" id="composer-annual-returns" data-colspan="5">
+      <tbody>
+        <tr><td colspan="5" class="loading-cell">等待计算</td></tr>
+      </tbody>
+    </table>
+    <h3>策略权重</h3>
+    <table class="data-table" id="composer-weights"></table>
+    <h3>持仓明细</h3>
+    <table class="data-table" id="composer-holdings"></table>
+  </article>
+</section>
+
+<script>
+document.getElementById('composer-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const submitButton = event.currentTarget.querySelector('button[type="submit"]');
+  const form = new FormData(event.currentTarget);
+  const strategies = form.getAll('strategy').map((strategyKey) => ({strategy_key: strategyKey}));
+  if (!strategies.length) {
+    alert('至少选择一个策略');
+    return;
+  }
+  const originalText = submitButton.textContent;
+  submitButton.disabled = true;
+  submitButton.textContent = '计算中...';
+  document.getElementById('composer-metrics').textContent = '加载中...';
+  document.getElementById('composer-annual-returns').innerHTML = `
+    <tbody>
+      <tr><td colspan="5" class="loading-cell">加载中...</td></tr>
+    </tbody>`;
+  const payload = {
+    strategies,
+    optimizer: {
+      kelly_scale: Number(form.get('kelly_scale')),
+      max_strategy_weight: Number(form.get('max_strategy_weight')),
+      allow_cash: form.get('allow_cash') === 'on'
+    },
+    benchmarks: ['000300.SH', 'HSI', 'IXIC']
+  };
+  const response = await fetch(`${window.location.origin}{{ site_root }}/api/composer/evaluate`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  submitButton.disabled = false;
+  submitButton.textContent = originalText;
+  if (!response.ok) {
+    document.getElementById('composer-metrics').textContent = '组合计算失败';
+    document.getElementById('composer-annual-returns').innerHTML = `
+      <tbody>
+        <tr><td colspan="5" class="loading-cell">组合计算失败</td></tr>
+      </tbody>`;
+    alert('组合计算失败');
+    return;
+  }
+  const data = await response.json();
+  window.qsCharts.renderComposerResult(data, "{{ site_root }}");
+});
+</script>
+{% endblock %}

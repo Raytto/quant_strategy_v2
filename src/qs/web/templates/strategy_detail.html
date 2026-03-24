@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}策略详情{% endblock %}
+{% block content %}
+{% if not definition %}
+<section class="card"><h1>策略不存在</h1></section>
+{% else %}
+<section class="header-row">
+  <div>
+    <p class="eyebrow">{{ definition.category }}</p>
+    <h1>{{ definition.display_name }}</h1>
+    <p>{{ definition.description }}</p>
+  </div>
+  {% if is_admin %}
+  <div class="hero-actions">
+    <button class="button js-refresh" data-strategy="{{ definition.strategy_key }}">刷新快照</button>
+  </div>
+  {% endif %}
+</section>
+
+<section class="stats-grid">
+  <article class="card stat"><span>最新运行</span><strong>{{ strategy.latest_completed_at if strategy else '无' }}</strong></article>
+  <article class="card stat"><span>默认基准</span><strong>{{ definition.default_benchmarks|join(', ') }}</strong></article>
+  <article class="card stat"><span>组合支持</span><strong>{{ '是' if definition.supports_composer else '否' }}</strong></article>
+</section>
+
+<section class="double-grid">
+  <article class="card">
+    <h2>指标</h2>
+    <div id="metrics-box">
+      <table class="data-table" id="metrics-table" data-colspan="{{ definition.default_benchmarks|length + 2 }}">
+        <tbody>
+          <tr><td colspan="{{ definition.default_benchmarks|length + 2 }}" class="loading-cell">加载中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </article>
+  <article class="card">
+    <h2>参数</h2>
+    <pre class="code-block">{{ definition.default_params | tojson(indent=2) }}</pre>
+  </article>
+</section>
+
+<section class="card">
+  <h2>净值与基准</h2>
+  <div id="equity-loading" class="loading-panel">加载中...</div>
+  <div class="chart is-hidden" id="equity-chart" data-run-id="{{ run_id }}"></div>
+</section>
+
+<section class="card">
+  <h2>历史年度收益</h2>
+  <table class="data-table" id="annual-returns-table" data-colspan="{{ definition.default_benchmarks|length + 2 }}">
+    <tbody>
+      <tr><td colspan="{{ definition.default_benchmarks|length + 2 }}" class="loading-cell">加载中...</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="double-grid">
+  <article class="card">
+    <h2>当前持仓 / 凯利建议</h2>
+    <table class="data-table" id="holdings-table">
+      <tbody>
+        <tr><td colspan="5" class="loading-cell">加载中...</td></tr>
+      </tbody>
+    </table>
+  </article>
+  <article class="card">
+    <h2>最近调仓</h2>
+    <div id="rebalance-list" class="stack-list">
+      <div class="stack-item loading-item">加载中...</div>
+    </div>
+  </article>
+</section>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const runId = "{{ run_id or '' }}";
+  const strategyKey = "{{ definition.strategy_key }}";
+  const button = document.querySelector('.js-refresh');
+  if (button) {
+    button.addEventListener('click', async () => {
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '刷新中...';
+      const response = await fetch(`${window.location.origin}{{ site_root }}/api/strategies/${strategyKey}/refresh`, {method: 'POST'});
+      button.disabled = false;
+      button.textContent = originalText;
+      if (response.ok) {
+        window.location.reload();
+      } else {
+        let message = '刷新失败';
+        try {
+          const data = await response.json();
+          if (data.detail) {
+            message = data.detail;
+          }
+        } catch (error) {
+        }
+        button.textContent = originalText;
+        alert(message);
+      }
+    });
+  }
+  if (runId) {
+    window.qsCharts.loadStrategyDetail("{{ site_root }}", runId);
+  } else {
+    document.getElementById('metrics-table').innerHTML = `
+      <tbody>
+        <tr><td colspan="{{ definition.default_benchmarks|length + 2 }}" class="loading-cell">暂无指标数据</td></tr>
+      </tbody>`;
+    document.getElementById('equity-loading').textContent = '暂无净值数据';
+    document.getElementById('annual-returns-table').innerHTML = `
+      <tbody>
+        <tr><td colspan="{{ definition.default_benchmarks|length + 2 }}" class="loading-cell">暂无年度收益数据</td></tr>
+      </tbody>`;
+    document.getElementById('holdings-table').innerHTML = `
+      <tbody>
+        <tr><td colspan="5" class="loading-cell">暂无持仓数据</td></tr>
+      </tbody>`;
+    document.getElementById('rebalance-list').innerHTML = '<div class="stack-item loading-item">暂无调仓记录</div>';
+  }
+});
+</script>
+{% endif %}
+{% endblock %}
